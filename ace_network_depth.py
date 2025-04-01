@@ -41,7 +41,11 @@ class RelativeDepthLoss(nn.Module):
         flat_mask = mask.view(-1)
         
         # 计算元素间差值
-        diff = flat_depth1.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
+        diff1 = flat_depth1.unsqueeze(1) - flat_depth1.unsqueeze(0)  # [HW,HW]
+        diff2 = flat_depth2.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
+        diff = diff1-diff2
+        # 两幅图之间直接进行相对深度计算
+        # diff = flat_depth1.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
         valid_mask = flat_mask.unsqueeze(1) & flat_mask.unsqueeze(0)  # 有效对掩膜
         
         # 空间距离归一化

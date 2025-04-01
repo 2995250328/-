@@ -43,10 +43,10 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate_max', type=float, default=0.005,
                         help='highest learning rate of 1 cycle scheduler')
 
-    parser.add_argument('--training_buffer_size', type=int, default=8000000,
+    parser.add_argument('--training_buffer_size', type=int, default=4000000,
                         help='number of patches in the training buffer')
     
-    parser.add_argument('--onebuffer', type=int, default=8000000,
+    parser.add_argument('--onebuffer', type=int, default=4000000,
                         help='number of patches in the one training buffer')
 
     parser.add_argument('--samples_per_image', type=int, default=1024,
@@ -143,7 +143,7 @@ if __name__ == '__main__':
     # Params for the depth anything. 
     parser.add_argument('--depth_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
 
-    parser.add_argument('--depth_epochs', type=int, default=2,
+    parser.add_argument('--depth_epochs', type=int, default=200,
                         help='number of runs through the training buffer')
     
     parser.add_argument('--depth_batch_size', type=int, default=1,
