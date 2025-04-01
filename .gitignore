@@ -1,0 +1,13 @@
+__pycache__/
+.idea/
+
+# Dataset files.
+datasets/
+ace_models/
+depth_checkpoints/
+
+# Outputs.
+output/
+
+wtconv/
+wtconvnext/

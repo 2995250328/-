@@ -1,0 +1,1 @@
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000616.color.png',)

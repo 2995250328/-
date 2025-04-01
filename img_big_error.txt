@@ -1,0 +1,6 @@
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000610.color.png',)
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000611.color.png',)
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000614.color.png',)
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000615.color.png',)
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000625.color.png',)
+('datasets/pgt_7scenes_fire/test/rgb/seq-04-frame-000633.color.png',)
