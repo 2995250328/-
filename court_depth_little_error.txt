@@ -1,0 +1,1 @@
+('../glace/datasets/Cambridge_Court/test/rgb/seq4_frame00052.png',)

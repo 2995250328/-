@@ -802,6 +802,9 @@ class TrainerACE:
         if old_optimizer_step < self.optimizer._step_count < self.scheduler.total_steps:
             self.scheduler.step()
 
+    def RGBD_run_epoch(self,training_dataloader):
+        return 0
+
     def depth_run_epoch(self,training_dataloader):
         """
         Run one epoch of training, shuffling the feature buffer and iterating over it.

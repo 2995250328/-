@@ -205,7 +205,7 @@ if __name__ == '__main__':
     # Testing loop.
     testing_start_time = time.time()
     with torch.no_grad():
-        for image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
+        for _,image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
             batch_start_time = time.time()
             batch_size = image_B1HW.shape[0]
 

@@ -3,7 +3,12 @@
 import logging
 import random
 import time
+import cv2
+import matplotlib
 from tqdm import *
+from skimage import color
+from skimage import io
+from skimage.transform import rotate, resize
 
 import numpy as np
 import torch
@@ -67,7 +72,7 @@ if __name__ == '__main__':
     options = parser.parse_args()
     dataset = CamLocDataset(
         root_dir=options.scene / "train",
-        mode=0,  # Default for ACE, we don't need scene coordinates/RGB-D.
+        mode=1,  # Default for ACE, we don't need scene coordinates/RGB-D.
         use_half=options.use_half,
         image_height=options.image_resolution,
         augment=options.use_aug,
@@ -83,7 +88,7 @@ if __name__ == '__main__':
     loader_generator = torch.Generator()
     loader_generator.manual_seed(1564)
     batch_sampler = sampler.BatchSampler(sampler.RandomSampler(dataset, generator=batch_generator),
-                                                batch_size=2,
+                                                batch_size=1,
                                                 drop_last=False)
 
     def seed_worker(worker_id):
@@ -124,25 +129,39 @@ if __name__ == '__main__':
         # 3. 移除通道维度并转为 numpy
         image = tensor.squeeze(0).numpy()  # 形状 (H, W)
         return image
+    cmap = matplotlib.colormaps.get_cmap('Spectral_r')
+    rootdir = options.scene / "train"
+    coord_dir = rootdir / 'depth'
+    coord_files = sorted(coord_dir.iterdir())
+    depth = io.imread(coord_files[0])
+    depth = depth.astype(np.float64)
+    depth /= 1000  # from millimeters to meters
+    depth = (cmap(depth)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+    cv2.namedWindow("Combined Image", cv2.WINDOW_NORMAL)
+    cv2.imshow("Combined Image", depth)
+    print(depth)
+    key = cv2.waitKey(0)
+    if key == 27:  
+        cv2.destroyAllWindows()
 
-    for image_RGB,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
-            # fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-            # print(image_RGB.shape,image_B1HW.shape)
-            for i in range(image_RGB.size(0)):
-                # 显示图像
-                img_grey = tensor_to_grayscale_image(image_B1HW[i])
-                plt.figure()
-                plt.imshow(img_grey, cmap='gray', vmin=0, vmax=1)
-                img = tensor_to_image(image_RGB[i])  # 转换张量格式
-                plt.figure()
-                plt.imshow(img)
-                # axes[i].imshow(img)  # 确保像素值在[0,1]范围
-                # axes[i].axis('off')
-                # axes[i].set_title(f'Batch Image {i+1}') 
-            plt.show()                 
-            # 控制刷新逻辑
-            user_input = input("按回车显示下一批，输入q退出: ")
-            plt.close()  # 关闭当前图像释放内存
-
-            if user_input.lower() == 'q':
-                break
+    # for image_RGB,depth,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
+    #         # fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    #         # print(image_RGB.shape,image_B1HW.shape)
+    #         # 深度图可视化
+    #         print(depth)
+            # pred_depth_np = pred_depth*255.0
+            # pred_depth_np = pred_depth_np.detach().cpu().numpy().astype(np.uint8)
+            # pred_depth_np = (cmap(pred_depth_np)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+            # depth_HW_np = depth_HW*255.0
+            # depth_HW_np = depth_HW_np.detach().cpu().numpy().astype(np.uint8)
+            # depth_HW_np = (cmap(depth_HW_np)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+            # cv2.namedWindow("Combined Image", cv2.WINDOW_NORMAL)
+            # combined = np.hstack((pred_depth_np,depth_HW_np))
+            # # 将拼接后的图像放大 2 倍
+            # display_img = cv2.resize(combined, (combined.shape[1] * 4, combined.shape[0] * 4))
+            # cv2.resizeWindow("Combined Image", combined.shape[1] * 4, combined.shape[0] * 4)
+            # cv2.imshow("Combined Image", display_img)
+            # cv2.imshow("Raw Image", image_BGR)
+            # key = cv2.waitKey(0)
+            # if key == 27:  
+            #     cv2.destroyAllWindows()
