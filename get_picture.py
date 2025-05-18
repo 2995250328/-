@@ -28,7 +28,7 @@ def process_images_from_txt(txt_path, output_folder):
         print(f"Saved: {output_path}")
 
 # 设置文件路径和输出目录
-txt_file = "7scenes_office_16m_4head_big_error.txt"  # 替换为你的txt文件路径
-output_dir = "7scenes_office_16m_4head_big_error"  # 替换为你的输出目录
+txt_file = "7scenes_stairs_feat4_conf2_supp_16m_4head_big_error.txt"  # 替换为你的txt文件路径
+output_dir = "7scenes_stairs_feat4_conf2_supp_16m_4head_big_errorr"  # 替换为你的输出目录
 
 process_images_from_txt(txt_file, output_dir)

@@ -421,7 +421,7 @@ if __name__ == '__main__':
     _logger.info(f"Avg. processing time: {avg_time * 1000:4.1f}ms")
 
     # Write to the test log file as well.
-    test_log.write(f"{median_rErr} {median_tErr} {avg_time}\n")
+    test_log.write(f"{pct10_5} {pct5} {pct2} {pct1} {median_rErr} {ave_rErr}\n")
 
     test_log.close()
     pose_log.close()

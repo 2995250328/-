@@ -55,7 +55,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=5120,
                         help='number of patches for each parameter update (has to be a multiple of 512)')
 
-    parser.add_argument('--epochs', type=int, default=16,
+    parser.add_argument('--epochs', type=int, default=16000,
                         help='number of runs through the training buffer')
 
     parser.add_argument('--repro_loss_hard_clamp', type=int, default=1000,

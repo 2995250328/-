@@ -25,6 +25,95 @@ class RelativeDepthLoss(nn.Module):
         self.sobel_x.weight.data = sobel_kernel_x.view(1, 1, 3, 3)
         self.sobel_y.weight.data = sobel_kernel_y.view(1, 1, 3, 3)
         
+        # 注册缓存参数
+        self.register_buffer('alpha', None)
+        self.register_buffer('beta', None)
+        self.register_buffer('pred_aligned', None)
+
+    def compute_scale_shift(self, pred, target, mask):
+        """
+        计算尺度和平移参数
+        参数:
+            pred: 预测深度图 (B x H x W)
+            target: GT 深度图 (B x H x W)
+            mask: 有效区域掩码 (B x H x W)
+        返回:
+            alpha: 尺度参数
+            beta: 平移参数
+        """
+        pred = pred.view(pred.size(0), -1)
+        target = target.view(target.size(0), -1)
+        mask = mask.view(mask.size(0), -1)
+
+        alphas = []
+        betas = []
+
+        for i in range(pred.size(0)):
+            d_pred = pred[i]
+            d_gt = target[i]
+            m = mask[i]
+
+            d_pred = d_pred[m > 0]
+            d_gt = d_gt[m > 0]
+
+            if d_gt.numel() == 0:
+                alphas.append(torch.tensor(1.0, device=pred.device))
+                betas.append(torch.tensor(0.0, device=pred.device))
+                continue
+
+            A = torch.stack([d_pred, torch.ones_like(d_pred)], dim=1)  # Nx2
+            x, _ = torch.lstsq(d_gt.unsqueeze(1), A)  # [alpha, beta]
+            alpha, beta = x[:2, 0]
+            alphas.append(alpha)
+            betas.append(beta)
+
+        return torch.stack(alphas), torch.stack(betas)
+
+    def apply_scale_shift(self, pred, alpha, beta):
+        """
+        应用尺度和平移变换
+        参数:
+            pred: 预测深度图 (B x H x W)
+            alpha: 尺度参数 (B)
+            beta: 平移参数 (B)
+        返回:
+            变换后的深度图 (B x H x W)
+        """
+        alpha = alpha.view(-1, 1, 1)
+        beta = beta.view(-1, 1, 1)
+        return alpha * pred + beta
+
+    def compute_gradient(self, img):
+        # Sobel近似：简单差分算子（[0,1] - [1,0]）
+        D_dy = img[:, :, 1:, :] - img[:, :, :-1, :]
+        D_dx = img[:, :, :, 1:] - img[:, :, :, :-1]
+        
+        # 补全边缘尺寸
+        D_dy = torch.nn.functional.pad(D_dy, (0, 0, 0, 1), mode='replicate')
+        D_dx = torch.nn.functional.pad(D_dx, (0, 1, 0, 0), mode='replicate')
+        
+        return D_dx, D_dy
+
+    def gradient_matching_loss(self, pred, target, mask=None):
+        """
+        pred: 预测深度图 (B x 1 x H x W)
+        target: GT 深度图 (B x 1 x H x W)
+        mask: 可选掩码（B x 1 x H x W）
+        """
+        pred_dx, pred_dy = self.compute_gradient(pred)
+        target_dx, target_dy = self.compute_gradient(target)
+
+        if mask is not None:
+            pred_dx = pred_dx * mask
+            pred_dy = pred_dy * mask
+            target_dx = target_dx * mask
+            target_dy = target_dy * mask
+
+        loss_x = torch.abs(pred_dx - target_dx)
+        loss_y = torch.abs(pred_dy - target_dy)
+
+        return (loss_x.mean() + loss_y.mean()) / 2.0
+
     def compute_pairwise_diff(self, depth1, depth2, mask):
         """
         计算成对像素深度差矩阵
@@ -40,15 +129,17 @@ class RelativeDepthLoss(nn.Module):
         flat_depth2 = depth2.view(-1)
         flat_mask = mask.view(-1)
         
-        # 计算元素间差值
-        # diff1 = flat_depth1.unsqueeze(1) - flat_depth1.unsqueeze(0)  # [HW,HW]
-        # diff2 = flat_depth2.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
-        # diff = diff1-diff2
-        # 两幅图之间直接进行相对深度计算
+        # 使用已计算的尺度和平移参数
+        if self.alpha is not None and self.beta is not None:
+            alpha = self.alpha.view(-1, 1)
+            beta = self.beta.view(-1, 1)
+            flat_depth1 = alpha * flat_depth1 + beta
+        
+        # 计算成对差异
         diff = flat_depth1.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
         valid_mask = flat_mask.unsqueeze(1) & flat_mask.unsqueeze(0)  # 有效对掩膜
         
-        # 空间距离归一化
+        # 计算空间距离权重
         coord = torch.stack(torch.meshgrid(
             torch.arange(H), torch.arange(W), indexing='ij'
         ), -1).float().to(depth1.device)
@@ -61,33 +152,46 @@ class RelativeDepthLoss(nn.Module):
         
         return diff / spatial_dist, valid_mask
 
-    def forward(self, pred_depth, gt_depth,valid_mask):
+    def forward(self, pred_depth, gt_depth, valid_mask):
         """
         前向计算总损失
         参数:
             pred_depth: 预测深度图 [B,1,H,W]
             gt_depth:   真值深度图 [B,1,H,W]
+            valid_mask: 有效区域掩码 [B,1,H,W]
         返回:
             total_loss: 总损失值
         """       
-        # 基础深度差异损失(网页6像素差异损失)
-        # depth_diff = (pred_depth - gt_depth).abs()
-        # depth_loss = (depth_diff * valid_mask).sum() / valid_mask.sum()
+        # 计算并缓存尺度和平移参数
+        self.alpha, self.beta = self.compute_scale_shift(
+            pred_depth.squeeze(1), 
+            gt_depth.squeeze(1), 
+            valid_mask.squeeze(1)
+        )
         
-        # 多尺度梯度一致性损失(网页1/网页4梯度约束)
-        grad_x_pred = self.sobel_x(pred_depth.unsqueeze(0))
-        grad_y_pred = self.sobel_y(pred_depth.unsqueeze(0))
-        grad_x_gt = self.sobel_x(gt_depth.unsqueeze(0))
-        grad_y_gt = self.sobel_y(gt_depth.unsqueeze(0))
-        grad_diff = (grad_x_pred - grad_x_gt).abs() + (grad_y_pred - grad_y_gt).abs()
-        grad_loss = (grad_diff * valid_mask).sum() / valid_mask.sum()
+        # 计算并缓存对齐后的预测深度图
+        self.pred_aligned = self.apply_scale_shift(
+            pred_depth.squeeze(1), 
+            self.alpha, 
+            self.beta
+        )
         
-        # 成对相对差异损失(网页6相对排序损失扩展)
-        pair_diff, pair_mask = self.compute_pairwise_diff(pred_depth, gt_depth, valid_mask)
+        # 尺度和平移不变性损失
+        ssi_loss = ((self.pred_aligned - gt_depth.squeeze(1)) ** 2 * valid_mask.squeeze(1)).sum() / (valid_mask.sum() + 1e-5)
+        
+        # 梯度匹配损失
+        grad_loss = self.gradient_matching_loss(pred_depth, gt_depth, valid_mask)
+        
+        # 成对相对差异损失
+        pair_diff, pair_mask = self.compute_pairwise_diff(
+            pred_depth.squeeze(1), 
+            gt_depth.squeeze(1), 
+            valid_mask.squeeze(1)
+        )
         pair_loss = (pair_diff.abs() * pair_mask).sum() / math.sqrt(pair_mask.sum()+1e-5)
         
-        # 总损失组合(网页5损失权重思想)
-        total_loss = (1-self.weight)*grad_loss + self.weight*pair_loss
+        # 总损失组合
+        total_loss = (1-self.weight)*(ssi_loss + grad_loss) + self.weight*pair_loss
         return math.log(total_loss+1)
 
 def compute_patch_indices(coords, H, W, patch_size=8):
@@ -412,10 +516,16 @@ class Regressor(nn.Module):
         for k, v in encoder_state_dict.items():
             merged_state_dict[f"encoder.{k}"] = v
 
-        for key in network_state_dict:
-            for k, v in network_state_dict[key].items():
-                print(k)
-                merged_state_dict[f"{key}.{k}"] = v
+        first_value = next(iter(network_state_dict.values()))
+        if isinstance(first_value, dict):
+            # 说明是嵌套的，需要两层遍历
+            for key in network_state_dict:
+                for k, v in network_state_dict[key].items():
+                    merged_state_dict[f"{key}.{k}"] = v
+        else:
+            # 说明是普通的 state_dict，直接一层遍历
+            for k, v in network_state_dict.items():
+                merged_state_dict[f"heads.{k}"] = v
         # for key in merged_state_dict.keys():
         #     print(key)
 

@@ -162,6 +162,7 @@ class TrainerACE:
             num_head_blocks=self.options.num_head_blocks,
             use_homogeneous=self.options.use_homogeneous
         )
+        # 加载训练好的模型，看回归头结果
         # network_state_dict = torch.load(self.options.output_map_file, map_location="cpu")
         # self.regressor = Regressor.create_from_split_state_dict(encoder_state_dict, network_state_dict)
         _logger.info(f"Loaded pretrained encoder from: {self.options.encoder_path}")
@@ -400,7 +401,7 @@ class TrainerACE:
             
             while buffer_idx < self.options.onebuffer:
                 dataset_passes += 1
-                for image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
+                for _,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
                     # print(image_B1HW.shape)
                     # Copy to device.
                     image_B1HW = image_B1HW.to(self.device, non_blocking=True)
@@ -694,168 +695,6 @@ class TrainerACE:
                     print(f'\r{buffer_idx}/{self.options.onebuffer}',end="")
                     if buffer_idx >= self.options.onebuffer:
                         break
-        # with torch.no_grad():
-        #     # Iterate until the training buffer is full.
-        #     buffer_idx = 0
-        #     dataset_passes = 0
-        #     training_buffer_size = self.options.onebuffer
-            
-        #     while buffer_idx < self.options.onebuffer:
-        #         dataset_passes += 1
-        #         for image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
-        #             # print(image_B1HW.shape)
-        #             # Copy to device.
-        #             image_B1HW = image_B1HW.to(self.device, non_blocking=True)
-        #             _,_,I_H,I_W = image_B1HW.shape
-        #             #print(image_B1HW.shape)
-        #             img_rate = min(I_W,I_H)/480
-        #             #print(img_rate)
-        #             image_BHW = image_B1HW.squeeze(1)
-        #             image_HW = image_BHW.squeeze(0)
-        #             image_HW_np = image_HW.cpu().numpy().astype(np.float32)
-        #             #print(image_B1HW.shape)
-        #             image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
-        #             #print(image_mask_B1HW.shape)
-        #             gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
-        #             intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
-        #             intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
-
-        #             # Compute image features.
-        #             with autocast(enabled=self.options.use_half):
-        #                 features_BCHW = self.regressor.get_features(image_B1HW)
-        #             pts, desc, _ = self.superpoint.run(image_HW_np)
-        #             if desc is None:
-        #                 continue
-        #             #print(features_BCHW.shape)
-        #             # 得到特征点和描述符的tensor
-        #             pts_tensor = torch.from_numpy(pts)
-        #             desc_tensor = torch.from_numpy(desc)
-        #             pts_tensor = pts_tensor.permute(1,0).to(self.device,non_blocking=True,dtype=features_BCHW.dtype)
-        #             desc_tensor = desc_tensor.permute(1,0).to(self.device,non_blocking=True,dtype=features_BCHW.dtype)
-        #             #print(pts_tensor[0:3,:])
-        #             # 从superpoint提取得到特征点坐标（x，y），转换为所在patch的中心点坐标与pixel_positions_B2HW对应
-        #             pts_tensor[:,:2] = (pts_tensor[:,:2]//self.regressor.OUTPUT_SUBSAMPLE)*self.regressor.OUTPUT_SUBSAMPLE + \
-        #                     torch.tensor(4,device=pts_tensor.device,dtype=pts_tensor.dtype)
-        #             #print(pts_tensor[0:3,:])                  
-
-        #             # Dimensions after the network's downsampling.
-        #             B, C, H, W = features_BCHW.shape
-        #             #print(features_BCHW.shape)
-
-        #             # The image_mask needs to be downsampled to the actual output resolution and cast to bool.
-        #             image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
-        #             image_mask_B1HW = image_mask_B1HW.bool()
-
-        #             # If the current mask has no valid pixels, continue.
-        #             if image_mask_B1HW.sum() == 0:
-        #                 continue
-
-        #             # Create a tensor with the pixel coordinates of every feature vector.
-        #             # 每个grid坐标在生成时乘了下采样率，也就是说坐标对应的是原始图片的像素位置。
-        #             pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone()  # It's 2xHxW (actual H and W) now.
-        #             #print(pixel_positions_B2HW)
-        #             pixel_positions_B2HW = pixel_positions_B2HW[None]  # 1x2xHxW
-        #             pixel_positions_B2HW = pixel_positions_B2HW.expand(B, 2, H, W)  # Bx2xHxW
-
-        #             # Bx3x4 -> Nx3x4 (for each image, repeat pose per feature)
-        #             # N=B*H*W
-        #             gt_pose_inv = gt_pose_inv_B44[:, :3] 
-        #             gt_pose_inv = gt_pose_inv.unsqueeze(1).expand(B, H * W, 3, 4).reshape(-1, 3, 4)
-
-        #             # Bx3x3 -> Nx3x3 (for each image, repeat intrinsics per feature)
-        #             intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
-        #             intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
-
-        #             def normalize_shape(tensor_in):
-        #                 """Bring tensor from shape BxCxHxW to NxC"""
-        #                 return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
-        #             features_NC = normalize_shape(features_BCHW)
-        #             pixel_positions_N2 = normalize_shape(pixel_positions_B2HW)
-
-        #             # 从特征点对应patch的中心坐标出发，找相邻的8/4个patch中心坐标，得到对应坐标、置信度、来源坐标的索引
-        #             # 置信度是为了区分可能得到的相同patch坐标，来源索引是为了后续从desc向量中得到对应patch的描述符
-        #             pts_np = pts_tensor.cpu().numpy().astype(np.float32)
-        #             #print(pts_np.shape)
-        #             position_confidence_idx = find_neighbors_with_confidence(pts_np,I_H,I_W,self.regressor.OUTPUT_SUBSAMPLE,4)
-        #             position_confidence_idx = torch.from_numpy(position_confidence_idx).to(device=self.device,dtype=features_NC.dtype)
-        #             #print(position_confidence_idx.shape)
-        #             indices=[]
-        #             for coord in position_confidence_idx[:,:2]:
-        #                 match = torch.all(pixel_positions_N2 == coord,dim=1)
-        #                 idx = torch.where(match)[0]
-        #                 if idx.numel()>0:
-        #                     indices.append(idx.item())
-        #             indices = torch.tensor(indices,device=image_B1HW.device,dtype=torch.int)
-        #             #print(indices.shape)
-
-        #             # 从desc中得到对应坐标来源的描述符
-        #             desc_vector = []
-        #             for idx in position_confidence_idx[:,3]:
-        #                 #print(idx)
-        #                 if idx >= desc_tensor.shape[0]:
-        #                     break
-        #                 desc_vector.append(desc_tensor[idx.to(dtype=torch.int),:].tolist())
-        #             desc_vector = torch.tensor(desc_vector,device=image_B1HW.device,dtype=image_B1HW.dtype)
-        #             #print(desc_vector.shape)
-
-        #             batch_data = {
-        #                 'features': features_NC,
-        #                 'target_px': pixel_positions_N2,
-        #                 'gt_poses_inv': gt_pose_inv,
-        #                 'intrinsics': intrinsics,
-        #                 'intrinsics_inv': intrinsics_inv
-        #             }
-
-        #             batch_data1 =batch_data.copy()
-        #             batch_data2 =batch_data.copy()
-
-        #             # Turn image mask into sampling weights (all equal).
-        #             image_mask_B1HW = image_mask_B1HW.float()
-        #             image_mask_N1 = normalize_shape(image_mask_B1HW)
-
-        #             features_to_select = indices.shape[0]
-        #             #print(features_to_select)
-        #             features_to_select = torch.tensor(min(features_to_select, self.options.onebuffer - buffer_idx),
-        #                                             dtype=torch.int)   
-        #             for k in batch_data:
-        #                 batch_data1[k] = batch_data[k][indices[:features_to_select]]       
-
-        #             # 采样数量小于预设值且未到结尾，补充采样         
-        #             supplement_flag = False    
-        #             supplement_select = 0   
-        #             samples_per_image = int(img_rate*self.options.samples_per_image * B)              
-        #             # print(f'每张图片采样数量{samples_per_image}')
-        #             if indices.shape[0] < samples_per_image and features_to_select == indices.shape[0]:
-                        
-        #                 supplement_select = samples_per_image - indices.shape[0]
-        #                 supplement_select = torch.tensor(min(supplement_select, self.options.onebuffer - buffer_idx - features_to_select),
-        #                                             dtype=torch.int)   
-        #                 if supplement_select != 0:
-        #                     supplement_flag = True
-        #                     sample_idxs = torch.multinomial(image_mask_N1.view(-1),
-        #                                             supplement_select,
-        #                                             replacement=True,
-        #                                             generator=self.sampling_generator)
-        #                     for k in batch_data:
-        #                         batch_data2[k] = batch_data[k][sample_idxs]  
-                               
-        #             # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
-        #             buffer_offset = buffer_idx + features_to_select + supplement_select
-        #             # print(f'实际采样数量{features_to_select + supplement_select}')
-        #             if supplement_flag:
-        #                 for k in batch_data:
-        #                     self.training_buffer[k][buffer_idx:buffer_offset] = torch.cat((batch_data1[k],batch_data2[k]),dim=0)
-        #                 # print("batch_data1 shape:", batch_data1['features'].shape)
-        #                 # print("batch_data2 shape:", batch_data2['features'].shape)
-        #             else:
-        #                 for k in batch_data:                          
-        #                     self.training_buffer[k][buffer_idx:buffer_offset] = batch_data1[k]
-        #                 # print("batch_data1 shape:", batch_data1['features'].shape)
-
-        #             buffer_idx = buffer_offset
-        #             print(f'\r{buffer_idx}/{self.options.onebuffer}',end="")
-        #             if buffer_idx >= self.options.onebuffer:
-        #                 break
         print()
         buffer_memory = sum([v.element_size() * v.nelement() for k, v in self.training_buffer.items()])
         buffer_memory /= 1024 * 1024 * 1024
@@ -1181,20 +1020,6 @@ class TrainerACE:
         # # Only step if the optimizer stepped and if we're not over-stepping the total_steps supported by the scheduler.
         # if old_optimizer_step < self.optimizer_depth._step_count < self.scheduler_depth.total_steps:
         #     self.scheduler_depth.step()
-            
-        
-        
-        # print('11111111111111111111111111111111')
-        # print(pred_depth_valid)
-        # print('22222222222222222222222222')
-        # print(depth_HW_valid)
-
-
-
-
-
-
-        
 
 
 
