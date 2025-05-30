@@ -34,112 +34,116 @@ class RelativeDepthLoss(nn.Module):
         """
         计算尺度和平移参数
         参数:
-            pred: 预测深度图 (B x H x W)
-            target: GT 深度图 (B x H x W)
-            mask: 有效区域掩码 (B x H x W)
+            pred: 预测深度图 (H x W)
+            target: GT 深度图 (H x W)
+            mask: 有效区域掩码 (H x W)
         返回:
             alpha: 尺度参数
             beta: 平移参数
         """
-        pred = pred.view(pred.size(0), -1)
-        target = target.view(target.size(0), -1)
-        mask = mask.view(mask.size(0), -1)
+        # 获取有效区域
+        valid_idx = mask > 0
+        if not valid_idx.any():
+            return torch.tensor(1.0, device=pred.device), torch.tensor(0.0, device=pred.device)
 
-        alphas = []
-        betas = []
+        d_pred = pred[valid_idx]
+        d_gt = target[valid_idx]
 
-        for i in range(pred.size(0)):
-            d_pred = pred[i]
-            d_gt = target[i]
-            m = mask[i]
+        # 计算尺度和平移参数
+        A = torch.stack([d_pred, torch.ones_like(d_pred)], dim=1)  # Nx2
+        x = torch.linalg.lstsq(A, d_gt.unsqueeze(1)).solution  # [2,1]
+        alpha, beta = x[:2, 0]
 
-            d_pred = d_pred[m > 0]
-            d_gt = d_gt[m > 0]
-
-            if d_gt.numel() == 0:
-                alphas.append(torch.tensor(1.0, device=pred.device))
-                betas.append(torch.tensor(0.0, device=pred.device))
-                continue
-
-            A = torch.stack([d_pred, torch.ones_like(d_pred)], dim=1)  # Nx2
-            x, _ = torch.lstsq(d_gt.unsqueeze(1), A)  # [alpha, beta]
-            alpha, beta = x[:2, 0]
-            alphas.append(alpha)
-            betas.append(beta)
-
-        return torch.stack(alphas), torch.stack(betas)
+        return alpha, beta
 
     def apply_scale_shift(self, pred, alpha, beta):
         """
         应用尺度和平移变换
         参数:
-            pred: 预测深度图 (B x H x W)
-            alpha: 尺度参数 (B)
-            beta: 平移参数 (B)
+            pred: 预测深度图 (H x W)
+            alpha: 尺度参数
+            beta: 平移参数
         返回:
-            变换后的深度图 (B x H x W)
+            变换后的深度图 (H x W)
         """
-        alpha = alpha.view(-1, 1, 1)
-        beta = beta.view(-1, 1, 1)
         return alpha * pred + beta
 
     def compute_gradient(self, img):
-        # Sobel近似：简单差分算子（[0,1] - [1,0]）
-        D_dy = img[:, :, 1:, :] - img[:, :, :-1, :]
-        D_dx = img[:, :, :, 1:] - img[:, :, :, :-1]
+        """
+        计算图像梯度
+        参数:
+            img: 输入图像 (H x W)
+        返回:
+            D_dx: x方向梯度 (H x W)
+            D_dy: y方向梯度 (H x W)
+        """
+        # 计算梯度
+        D_dy = torch.zeros_like(img)
+        D_dx = torch.zeros_like(img)
         
-        # 补全边缘尺寸
-        D_dy = torch.nn.functional.pad(D_dy, (0, 0, 0, 1), mode='replicate')
-        D_dx = torch.nn.functional.pad(D_dx, (0, 1, 0, 0), mode='replicate')
+        # y方向梯度
+        D_dy[:-1, :] = img[1:, :] - img[:-1, :]
+        # x方向梯度
+        D_dx[:, :-1] = img[:, 1:] - img[:, :-1]
         
         return D_dx, D_dy
 
-    def gradient_matching_loss(self, pred, target, mask=None):
+    def gradient_matching_loss(self, pred, target, mask):
         """
-        pred: 预测深度图 (B x 1 x H x W)
-        target: GT 深度图 (B x 1 x H x W)
-        mask: 可选掩码（B x 1 x H x W）
+        计算梯度匹配损失
+        参数:
+            pred: 预测深度图 (H x W)
+            target: GT 深度图 (H x W)
+            mask: 有效区域掩码 (H x W)
+        返回:
+            梯度匹配损失
         """
+        # 计算梯度
         pred_dx, pred_dy = self.compute_gradient(pred)
         target_dx, target_dy = self.compute_gradient(target)
 
-        if mask is not None:
-            pred_dx = pred_dx * mask
-            pred_dy = pred_dy * mask
-            target_dx = target_dx * mask
-            target_dy = target_dy * mask
+        # 应用掩码
+        pred_dx = pred_dx * mask
+        pred_dy = pred_dy * mask
+        target_dx = target_dx * mask
+        target_dy = target_dy * mask
 
+        # 计算损失
         loss_x = torch.abs(pred_dx - target_dx)
         loss_y = torch.abs(pred_dy - target_dy)
 
         return (loss_x.mean() + loss_y.mean()) / 2.0
 
-    def compute_pairwise_diff(self, depth1, depth2, mask):
+    def compute_pairwise_diff(self, depth1, depth2, mask, alpha,beta):
         """
         计算成对像素深度差矩阵
         参数:
-            depth1: [H,W] 深度图1
-            depth2: [H,W] 深度图2 
-            mask:   [H,W] 有效像素掩膜
+            depth1: 深度图1 (H x W)
+            depth2: 深度图2 (H x W)
+            mask: 有效像素掩膜 (H x W)
+            alpha: 尺度参数
+            beta: 平移参数
         返回:
-            diff_matrix: [H*W,H*W] 成对差异矩阵
+            diff_matrix: 成对差异矩阵
+            valid_mask: 有效掩码
         """
-        H, W = depth1.shape
-        flat_depth1 = depth1.view(-1)  # [HW]
+        H, W = depth1.shape        
+        # 应用尺度和平移变换
+        depth1_aligned = alpha * depth1 + beta
+        H, W = depth1_aligned.shape
+        flat_depth1 = depth1_aligned.view(-1)  # [HW]
         flat_depth2 = depth2.view(-1)
         flat_mask = mask.view(-1)
         
-        # 使用已计算的尺度和平移参数
-        if self.alpha is not None and self.beta is not None:
-            alpha = self.alpha.view(-1, 1)
-            beta = self.beta.view(-1, 1)
-            flat_depth1 = alpha * flat_depth1 + beta
+        # 计算元素间差值
+        diff1 = flat_depth1.unsqueeze(1) - flat_depth1.unsqueeze(0)  # [HW,HW]
+        diff2 = flat_depth2.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
+        diff = diff1-diff2
         
-        # 计算成对差异
-        diff = flat_depth1.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
-        valid_mask = flat_mask.unsqueeze(1) & flat_mask.unsqueeze(0)  # 有效对掩膜
+        # 将掩码转换为布尔类型后再进行位运算
+        valid_mask = (flat_mask.unsqueeze(1) > 0) & (flat_mask.unsqueeze(0) > 0)  # 有效对掩膜
         
-        # 计算空间距离权重
+        # 空间距离归一化
         coord = torch.stack(torch.meshgrid(
             torch.arange(H), torch.arange(W), indexing='ij'
         ), -1).float().to(depth1.device)
@@ -156,72 +160,31 @@ class RelativeDepthLoss(nn.Module):
         """
         前向计算总损失
         参数:
-            pred_depth: 预测深度图 [B,1,H,W]
-            gt_depth:   真值深度图 [B,1,H,W]
-            valid_mask: 有效区域掩码 [B,1,H,W]
+            pred_depth: 预测深度图 (H x W)
+            gt_depth: 真值深度图 (H x W)
+            valid_mask: 有效区域掩码 (H x W)
         返回:
             total_loss: 总损失值
         """       
-        # 计算并缓存尺度和平移参数
-        self.alpha, self.beta = self.compute_scale_shift(
-            pred_depth.squeeze(1), 
-            gt_depth.squeeze(1), 
-            valid_mask.squeeze(1)
-        )
+        # 计算尺度和平移参数
+        alpha, beta = self.compute_scale_shift(pred_depth, gt_depth, valid_mask)
         
-        # 计算并缓存对齐后的预测深度图
-        self.pred_aligned = self.apply_scale_shift(
-            pred_depth.squeeze(1), 
-            self.alpha, 
-            self.beta
-        )
+        # 计算对齐后的预测深度图
+        pred_aligned = self.apply_scale_shift(pred_depth, alpha, beta)
         
         # 尺度和平移不变性损失
-        ssi_loss = ((self.pred_aligned - gt_depth.squeeze(1)) ** 2 * valid_mask.squeeze(1)).sum() / (valid_mask.sum() + 1e-5)
+        ssi_loss = ((pred_aligned - gt_depth) ** 2 * valid_mask).sum() / (valid_mask.sum() + 1e-5)
         
         # 梯度匹配损失
         grad_loss = self.gradient_matching_loss(pred_depth, gt_depth, valid_mask)
         
         # 成对相对差异损失
-        pair_diff, pair_mask = self.compute_pairwise_diff(
-            pred_depth.squeeze(1), 
-            gt_depth.squeeze(1), 
-            valid_mask.squeeze(1)
-        )
+        pair_diff, pair_mask = self.compute_pairwise_diff(pred_depth, gt_depth, valid_mask,alpha, beta)
         pair_loss = (pair_diff.abs() * pair_mask).sum() / math.sqrt(pair_mask.sum()+1e-5)
         
         # 总损失组合
         total_loss = (1-self.weight)*(ssi_loss + grad_loss) + self.weight*pair_loss
         return math.log(total_loss+1)
-
-def compute_patch_indices(coords, H, W, patch_size=8):
-        """
-        输入:
-        coords: [N, 2] 的张量，每一行为 [x, y]（整数坐标），表示 patch 的中心坐标
-        H, W: 图像高度和宽度
-        patch_size: 每个 patch 的尺寸（默认 8）
-        输出:
-        final_indices: [N] 的张量，每个元素为该原始坐标对应的 patch 序号
-        """
-        # 1. 去除重复的坐标
-        unique_coords, inverse_indices = torch.unique(coords, return_inverse=True, dim=0)
-        # print(unique_coords)
-        
-        # 2. 根据每个唯一坐标计算其所在的网格位置
-        # 行号（row）由 y 值决定，列号（col）由 x 值决定
-        rows = unique_coords[:, 1] // patch_size   # y // patch_size
-        cols = unique_coords[:, 0] // patch_size   # x // patch_size
-        
-        # 图像水平上有多少个 patch
-        num_cols = W // patch_size
-        
-        # 计算网格中该 patch 的序号（从 0 开始），序号 = row * num_cols + col
-        patch_idx = rows * num_cols + cols
-        # print(patch_idx)
-        
-        # 返回唯一的 patch 序号
-        return patch_idx
-
 def find_neighbors_with_confidence(coords, H, W, patch_size, include_diagonal=8):
     """
     Find neighbors for a 3D coordinate tensor with confidence values, filter duplicates

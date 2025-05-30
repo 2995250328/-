@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
 from torchvision import transforms
 import matplotlib.pyplot as plt
+from PIL import Image
 
 from ace_network import Regressor
 
@@ -41,7 +42,8 @@ class CamLocDataset(Dataset):
                  use_half=True,
                  num_clusters=None,
                  cluster_idx=None,
-                 ):
+                 transform=None,
+                 min_crop_ratio=0.7):
         """Constructor.
 
         Parameters:
@@ -67,22 +69,27 @@ class CamLocDataset(Dataset):
                 target clusters will result in the same split. See the paper for details of the approach. Disabled by
                 default.
             cluster_idx: If num_clusters is not None, then use this parameter to choose the cluster used for training.
+            transform: Optional transform to be applied on the image.
+            min_crop_ratio: Minimum ratio of the original image size to maintain after random cropping.
         """
-
         self.use_half = use_half
+
+        self.root_dir = root_dir
+        self.mode = mode
 
         self.init = (mode == 1)
         self.sparse = sparse
         self.eye = (mode == 2)
-
+        
         self.image_height = image_height
-
         self.augment = augment
         self.aug_rotation = aug_rotation
         self.aug_scale_min = aug_scale_min
         self.aug_scale_max = aug_scale_max
         self.aug_black_white = aug_black_white
         self.aug_color = aug_color
+        self.image_resize_transform = transform
+        self.min_crop_ratio = min_crop_ratio
 
         self.num_clusters = num_clusters
         self.cluster_idx = cluster_idx
@@ -150,11 +157,8 @@ class CamLocDataset(Dataset):
         # Image transformations. Excluding scale since that can vary batch-by-batch.
         if self.augment:
             self.image_transform = transforms.Compose([
-                # transforms.ToPILImage(),
-                # transforms.Resize(int(self.image_height * scale_factor)),
                 transforms.Grayscale(),
                 transforms.ColorJitter(brightness=self.aug_black_white, contrast=self.aug_black_white),
-                # saturation=self.aug_color, hue=self.aug_color),  # Disable colour augmentation.
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.4],  # statistics calculated over 7scenes training set, should generalize fairly well
@@ -162,16 +166,19 @@ class CamLocDataset(Dataset):
                 ),
             ])
             self.image_transform_RGB = transforms.Compose([
-                # transforms.ToPILImage(),
-                # transforms.Resize(int(self.image_height * scale_factor)),
-                # transforms.ColorJitter(brightness=self.aug_black_white, contrast=self.aug_black_white,saturation=0.4, hue=0.1),
-                # saturation=self.aug_color, hue=self.aug_color),  # Disable colour augmentation.
                 transforms.ToTensor()
+            ])
+            self.image_transform_dino = transforms.Compose([
+                transforms.GaussianBlur(9, sigma=(0.1, 2.0)),
+                transforms.ColorJitter(brightness=self.aug_black_white, contrast=self.aug_black_white),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],  # based on MobileNetV2 pytorch
+                    std=[0.229, 0.224, 0.225]
+                ),
             ])
         else:
             self.image_transform = transforms.Compose([
-                # transforms.ToPILImage(),
-                # transforms.Resize(self.image_height),
                 transforms.Grayscale(),
                 transforms.ToTensor(),
                 transforms.Normalize(
@@ -180,12 +187,14 @@ class CamLocDataset(Dataset):
                 ),
             ])
             self.image_transform_RGB = transforms.Compose([
-                # transforms.ToPILImage(),
-                # transforms.Resize(int(self.image_height * scale_factor)),
-                # transforms.ColorJitter(brightness=self.aug_black_white, contrast=self.aug_black_white,saturation=0.4, hue=0.1),
-                # saturation=self.aug_color, hue=self.aug_color),  # Disable colour augmentation.
-                transforms.ToTensor()
-                # transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+                transforms.ToTensor(),
+            ])
+            self.image_transform_dino = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],  # based on MobileNetV2 pytorch
+                    std=[0.229, 0.224, 0.225]
+                ),
             ])
 
         # We use this to iterate over all frames. If clustering is enabled this is used to filter them.
@@ -370,14 +379,63 @@ class CamLocDataset(Dataset):
 
         return pose
 
-    def _get_single_item(self, idx, image_height):
+    def _random_crop(self, image, centre_point, focal_length):
+        """随机裁剪图像并调整相机内参
+        
+        Args:
+            image: 图像(numpy数组或PIL图像)
+            centre_point: 相机主点坐标 [cx, cy]
+            focal_length: 相机焦距 [fx, fy]
+            
+        Returns:
+            cropped_image: 裁剪后的PIL图像
+            new_centre_point: 调整后的主点坐标
+            new_focal_length: 调整后的焦距
+        """
+        # 如果输入是numpy数组，转换为PIL图像
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+            
+        # 获取原始图像尺寸
+        orig_w, orig_h = image.size
+        
+        # 计算最小裁剪尺寸
+        min_w = int(orig_w * self.min_crop_ratio)
+        min_h = int(orig_h * self.min_crop_ratio)
+        
+        # 随机选择裁剪尺寸
+        crop_w = random.randint(min_w, orig_w)
+        crop_h = random.randint(min_h, orig_h)
+        
+        # 随机选择裁剪起点
+        left = random.randint(0, orig_w - crop_w)
+        top = random.randint(0, orig_h - crop_h)
+        
+        # 执行裁剪
+        cropped_image = TF.crop(image, top, left, crop_h, crop_w)
+        
+        # 调整相机内参
+        if centre_point is not None:
+            # 调整主点坐标
+            new_centre_point = [
+                centre_point[0] - left,
+                centre_point[1] - top
+            ]
+            # 焦距保持不变
+            new_focal_length = focal_length
+        else:
+            # 如果没有提供主点坐标，则使用图像中心
+            new_centre_point = None
+            new_focal_length = focal_length
+            
+        return cropped_image, new_centre_point, new_focal_length
 
+    def _get_single_item(self, idx, image_height):
         # Apply index indirection.
         idx = self.valid_file_indices[idx]
 
         # Load image.
-        image = self._load_image(idx)
-
+        image = self._load_image(idx) # 640*480
 
         # Load intrinsics.
         k = np.loadtxt(self.calibration_files[idx])
@@ -392,22 +450,36 @@ class CamLocDataset(Dataset):
             raise Exception("Calibration file must contain either a 3x3 camera \
                 intrinsics matrix or a single float giving the focal length \
                 of the camera.")
+        # print(focal_length)
+
+        # 执行随机裁剪
+        image, centre_point, focal_length = self._random_crop(image, centre_point, focal_length)
 
         # The image will be scaled to image_height, adjust focal length as well.
-        f_scale_factor = image_height / image.shape[0]
+        height = image.size[1]
+        image = self.image_resize_transform(image)
+        f_scale_factor = image.size[1] / height  # 使用裁剪后的图像高度
+        # print(focal_length)
         if centre_point:
             centre_point = [c * f_scale_factor for c in centre_point]
-            focal_length = [f * f_scale_factor for f in focal_length]
+            # 处理focal_length
+            if isinstance(focal_length, (list, tuple)):
+                focal_length = [f * f_scale_factor for f in focal_length]
+            else:
+                focal_length = focal_length * f_scale_factor
         else:
             focal_length *= f_scale_factor
 
         # Rescale image.
-        image = self._resize_image(image, image_height)
+        # image = self._resize_image(image, image_height)
         # Create mask of the same size as the resized image (it's a PIL image at this point).
         image_mask = torch.ones((1, image.size[1], image.size[0]))
 
         # Apply remaining transforms.
         image_RGB = self.image_transform_RGB(image)
+        image_dino = self.image_transform_dino(image)
+        if image_dino.shape[0] == 1:
+            image_dino = image_dino.repeat(3, 1, 1)
         image = self.image_transform(image)
 
         # Load pose.
@@ -535,7 +607,7 @@ class CamLocDataset(Dataset):
         # Also need the inverse.
         intrinsics_inv = intrinsics.inverse()
 
-        return image_RGB,image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, str(self.rgb_files[idx])
+        return image_dino, image_RGB, image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, str(self.rgb_files[idx])
 
     def __len__(self):
         return len(self.valid_file_indices)
