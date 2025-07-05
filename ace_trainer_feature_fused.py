@@ -173,7 +173,7 @@ class TrainerACE:
         self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
 
         # Setup learning rate scheduler.
-        steps_per_epoch = self.options.onebuffer*2 // self.options.batch_size
+        steps_per_epoch = self.options.onebuffer // self.options.batch_size
         self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer,
                                                        max_lr=self.options.learning_rate_max,
                                                        epochs=self.options.epochs,
@@ -189,7 +189,7 @@ class TrainerACE:
         self.pixel_grid_2HW = pixel_grid_2HW.to(self.device)
 
         # Compute total number of iterations.
-        self.iterations = self.options.epochs * self.options.onebuffer*2 // self.options.batch_size
+        self.iterations = self.options.epochs * self.options.onebuffer // self.options.batch_size
         self.iterations_output = 100 # print loss every n iterations, and (optionally) write a visualisation frame
 
         # Setup reprojection loss function.
@@ -239,7 +239,7 @@ class TrainerACE:
         training_time = 0.
 
         self.training_start = time.time()
-        num_train = self.options.training_buffer_size//(self.options.onebuffer*2)
+        num_train = self.options.training_buffer_size//(self.options.onebuffer)
 
         for i in range(num_train):
             print(f'第{i+1}次buffer训练')
@@ -316,14 +316,14 @@ class TrainerACE:
 
         # Create a training buffer that lives on the GPU.
         self.training_buffer = {
-            'features': torch.empty((self.options.onebuffer*2, self.regressor.feature_dim),
+            'features': torch.empty((self.options.onebuffer, self.regressor.feature_dim+256),
                                     dtype=(torch.float32, torch.float16)[self.options.use_half], device=self.device),
-            'target_px': torch.empty((self.options.onebuffer*2, 2), dtype=torch.float32, device=self.device),
-            'gt_poses_inv': torch.empty((self.options.onebuffer*2, 3, 4), dtype=torch.float32,
+            'target_px': torch.empty((self.options.onebuffer, 2), dtype=torch.float32, device=self.device),
+            'gt_poses_inv': torch.empty((self.options.onebuffer, 3, 4), dtype=torch.float32,
                                         device=self.device),
-            'intrinsics': torch.empty((self.options.onebuffer*2, 3, 3), dtype=torch.float32,
+            'intrinsics': torch.empty((self.options.onebuffer, 3, 3), dtype=torch.float32,
                                       device=self.device),
-            'intrinsics_inv': torch.empty((self.options.onebuffer*2, 3, 3), dtype=torch.float32,
+            'intrinsics_inv': torch.empty((self.options.onebuffer, 3, 3), dtype=torch.float32,
                                           device=self.device)
         }
 
@@ -338,94 +338,6 @@ class TrainerACE:
             training_buffer_size = self.options.onebuffer
             
             while buffer_idx < self.options.onebuffer:
-                dataset_passes += 1
-                for _,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
-
-                    # Copy to device.
-                    image_B1HW = image_B1HW.to(self.device, non_blocking=True)
-                    _,_,I_H,I_W = image_B1HW.shape
-                    image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
-                    #print(image_mask_B1HW.shape)
-                    gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
-                    intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
-                    intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
-
-                    # Compute image features.
-                    with autocast(enabled=self.options.use_half):
-                        features_BCHW = self.regressor.get_features(image_B1HW)                                             
-
-                    # Dimensions after the network's downsampling.
-                    B, C, H, W = features_BCHW.shape
-                    #print(features_BCHW.shape)
-
-                    # The image_mask needs to be downsampled to the actual output resolution and cast to bool.
-                    image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
-                    image_mask_B1HW = image_mask_B1HW.bool()
-
-                    # If the current mask has no valid pixels, continue.
-                    if image_mask_B1HW.sum() == 0:
-                        continue
-
-                    # Create a tensor with the pixel coordinates of every feature vector.
-                    # 每个grid坐标在生成时乘了下采样率，也就是说坐标对应的是原始图片的像素位置。
-                    pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone()  # It's 2xHxW (actual H and W) now.
-                    #print(pixel_positions_B2HW)
-                    pixel_positions_B2HW = pixel_positions_B2HW[None]  # 1x2xHxW
-                    pixel_positions_B2HW = pixel_positions_B2HW.expand(B, 2, H, W)  # Bx2xHxW
-
-                    # Bx3x4 -> Nx3x4 (for each image, repeat pose per feature)
-                    # N=B*H*W
-                    gt_pose_inv = gt_pose_inv_B44[:, :3] 
-                    gt_pose_inv = gt_pose_inv.unsqueeze(1).expand(B, H * W, 3, 4).reshape(-1, 3, 4)
-
-                    # Bx3x3 -> Nx3x3 (for each image, repeat intrinsics per feature)
-                    intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
-                    intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
-
-                    def normalize_shape(tensor_in):
-                        """Bring tensor from shape BxCxHxW to NxC"""
-                        return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
-                    features_NC = normalize_shape(features_BCHW)
-                    pixel_positions_N2 = normalize_shape(pixel_positions_B2HW)
-
-                    batch_data = {
-                        'features': features_NC,
-                        'target_px': pixel_positions_N2,
-                        'gt_poses_inv': gt_pose_inv,
-                        'intrinsics': intrinsics,
-                        'intrinsics_inv': intrinsics_inv
-                    }
-
-                    # Turn image mask into sampling weights (all equal).
-                    image_mask_B1HW = image_mask_B1HW.float()
-                    image_mask_N1 = normalize_shape(image_mask_B1HW)
-
-                    # Over-sample according to image mask.
-                    features_to_select = self.options.samples_per_image * B
-                    features_to_select = min(features_to_select, self.options.onebuffer - buffer_idx)
-                    
-                    # Sample indices uniformly, with replacement.
-                    sample_idxs = torch.multinomial(image_mask_N1.view(-1),
-                                                    features_to_select,
-                                                    replacement=True,
-                                                    generator=self.sampling_generator)
-                    # # Select the data to put in the buffer.
-                    for k in batch_data:
-                        batch_data[k] = batch_data[k][sample_idxs]
-                    # batch_data['features'] = torch.cat((batch_data['features'],desc_vector),dim=1)
-                    # print(batch_data['features'].shape)
-
-                    # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
-                    buffer_offset = buffer_idx + features_to_select
-                    for k in batch_data:
-                        self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
-
-                    buffer_idx = buffer_offset
-                    print(f'\r{buffer_idx}/{self.options.onebuffer}',end="")
-                    if buffer_idx >= self.options.onebuffer:
-                        break
-                
-            while buffer_idx < self.options.onebuffer*2:
                 dataset_passes += 1
                 for _,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
 
@@ -509,7 +421,7 @@ class TrainerACE:
                         if idx.numel()>0:
                             indices.append(idx.item())
                     indices = torch.tensor(indices,device=image_B1HW.device,dtype=torch.int)
-                    #print(indices.shape)
+                    # print(indices.shape)
 
                     # 从desc中得到对应坐标来源的描述符
                     desc_vector = []
@@ -519,7 +431,7 @@ class TrainerACE:
                             break
                         desc_vector.append(desc_tensor[idx.to(dtype=torch.int),:].tolist())
                     desc_vector = torch.tensor(desc_vector,device=image_B1HW.device,dtype=image_B1HW.dtype)
-                    #print(desc_vector.shape)
+                    # print(desc_vector.shape)
 
                     batch_data = {
                         'features': features_NC,
@@ -536,63 +448,55 @@ class TrainerACE:
                     image_mask_B1HW = image_mask_B1HW.float()
                     image_mask_N1 = normalize_shape(image_mask_B1HW)
 
-                    # # Over-sample according to image mask.
-                    # features_to_select = indices.shape[0]
-                    # features_to_select = torch.tensor(min(features_to_select, self.options.onebuffer - buffer_idx),
-                    #                                   dtype=torch.int)
-                    
-                    # # # Select the data to put in the buffer.
-                    # for k in batch_data:
-                    #     batch_data[k] = batch_data[k][indices[:features_to_select]]
-                    # # batch_data['features'] = torch.cat((batch_data['features'],desc_vector),dim=1)
-                    # # print(batch_data['features'].shape)
-
-                    # # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
-                    # buffer_offset = buffer_idx + features_to_select
-                    # for k in batch_data:
-                    #     self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
+                    # Over-sample according to image mask.
                     features_to_select = indices.shape[0]
-                    #print(features_to_select)
-                    features_to_select = torch.tensor(min(features_to_select, self.options.onebuffer*2 - buffer_idx),
+                    features_to_select = torch.tensor(min(features_to_select, self.options.onebuffer - buffer_idx),
                                                     dtype=torch.int)   
                     for k in batch_data:
                         batch_data1[k] = batch_data[k][indices[:features_to_select]]       
 
                     # 采样数量小于预设值且未到结尾，补充采样         
-                    supplement_flag = False    
-                    supplement_select = 0   
-                    samples_per_image = int(img_rate*self.options.samples_per_image * B)              
-                    # print(f'每张图片采样数量{samples_per_image}')
-                    if indices.shape[0] < samples_per_image and features_to_select == indices.shape[0]:
+                    # supplement_flag = False    
+                    # supplement_select = 0   
+                    # samples_per_image = int(img_rate*self.options.samples_per_image * B)              
+                    # # print(f'每张图片采样数量{samples_per_image}')
+                    # if indices.shape[0] < samples_per_image and features_to_select == indices.shape[0]:
                         
-                        supplement_select = samples_per_image - indices.shape[0]
-                        supplement_select = torch.tensor(min(supplement_select, self.options.onebuffer*2 - buffer_idx - features_to_select),
-                                                    dtype=torch.int)   
-                        if supplement_select != 0:
-                            supplement_flag = True
-                            sample_idxs = torch.multinomial(image_mask_N1.view(-1),
-                                                    supplement_select,
-                                                    replacement=True,
-                                                    generator=self.sampling_generator)
-                            for k in batch_data:
-                                batch_data2[k] = batch_data[k][sample_idxs]  
+                    #     supplement_select = samples_per_image - indices.shape[0]
+                    #     supplement_select = torch.tensor(min(supplement_select, self.options.onebuffer - buffer_idx - features_to_select),
+                    #                                 dtype=torch.int)   
+                    #     if supplement_select != 0:
+                    #         supplement_flag = True
+                    #         sample_idxs = torch.multinomial(image_mask_N1.view(-1),
+                    #                                 supplement_select,
+                    #                                 replacement=True,
+                    #                                 generator=self.sampling_generator)
+                    #         for k in batch_data:
+                    #             batch_data2[k] = batch_data[k][sample_idxs]  
                                
                     # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
-                    buffer_offset = buffer_idx + features_to_select + supplement_select
+                    #########################################################
+                    # buffer_offset = buffer_idx + features_to_select + supplement_select # 加supplement_select
+                    #########################################################
+                    buffer_offset = buffer_idx + features_to_select # 不加supplement_select
                     # print(f'实际采样数量{features_to_select + supplement_select}')
+                    supplement_flag = False
                     if supplement_flag:
                         for k in batch_data:
                             self.training_buffer[k][buffer_idx:buffer_offset] = torch.cat((batch_data1[k],batch_data2[k]),dim=0)
                         # print("batch_data1 shape:", batch_data1['features'].shape)
                         # print("batch_data2 shape:", batch_data2['features'].shape)
                     else:
-                        for k in batch_data:                          
-                            self.training_buffer[k][buffer_idx:buffer_offset] = batch_data1[k]
+                        for k in batch_data:   
+                            if k != 'features':                       
+                                self.training_buffer[k][buffer_idx:buffer_offset] = batch_data1[k]
+                            else:
+                                self.training_buffer['features'][buffer_idx:buffer_offset] = torch.cat([batch_data1['features'], desc_vector[:features_to_select,:]], dim=1)
                         # print("batch_data1 shape:", batch_data1['features'].shape)
 
                     buffer_idx = buffer_offset
-                    print(f'\r{buffer_idx}/{self.options.onebuffer*2}',end="")
-                    if buffer_idx >= self.options.onebuffer*2:
+                    print(f'\r{buffer_idx}/{self.options.onebuffer}',end="")
+                    if buffer_idx >= self.options.onebuffer:
                         break
                               
         print()
@@ -610,14 +514,14 @@ class TrainerACE:
         torch.backends.cudnn.benchmark = True
 
         # Shuffle indices.
-        random_indices = torch.randperm(self.options.onebuffer*2, generator=self.training_generator)
+        random_indices = torch.randperm(self.options.onebuffer, generator=self.training_generator)
 
         # Iterate with mini batches.
-        for batch_start in range(0, self.options.onebuffer*2, self.options.batch_size):
+        for batch_start in range(0, self.options.onebuffer, self.options.batch_size):
             batch_end = batch_start + self.options.batch_size
 
             # Drop last batch if not full.
-            if batch_end > self.options.onebuffer*2:
+            if batch_end > self.options.onebuffer:
                 continue
 
             # Sample indices.
@@ -641,7 +545,7 @@ class TrainerACE:
         channels = features_bC.shape[1]
 
         # Reshape to a "fake" BCHW shape, since it's faster to run through the network compared to the original shape.
-        # 实际上是把channels拆成了16*32
+        # 实际上是把batch拆成了16*32
         features_bCHW = features_bC[None, None, ...].view(-1, 16, 32, channels).permute(0, 3, 1, 2)
         #print(features_bCHW.shape)
         with autocast(enabled=self.options.use_half):

@@ -11,7 +11,91 @@ import torch.nn.functional as F
 from superpoint import SuperPointNet
 
 _logger = logging.getLogger(__name__)
+def find_neighbors_with_confidence(coords, H, W, patch_size, include_diagonal=8):
+    """
+    Find neighbors for a 3D coordinate tensor with confidence values, filter duplicates
+    based on confidence, and return the results.
 
+    Args:
+        coords (np.ndarray): Shape (N, 3), where each row contains (x, y, confidence).
+        H (int): Image height.
+        W (int): Image width.
+        patch_size (int): Size of the patch.
+        include_diagonal (bool): Whether to include diagonal neighbors.
+
+    Returns:
+        np.ndarray: Filtered neighbors with shape (M, 4), where each row contains
+                    (x, y, confidence, original_index).
+    """
+    # Define neighbor offsets
+    offsets =[(0,0)]
+    if include_diagonal==4:
+        offsets += [
+            (-1, 0), (1, 0), (0, -1), (0, 1)  # Up, Down, Left, Right
+        ]
+    elif include_diagonal==8:
+        offsets += [
+            (-1, -1), (-1, 1), (1, -1), (1, 1)  # Diagonal neighbors
+        ]
+
+    # Initialize results storage
+    neighbors = []
+    #print(f'{H}   {W}')
+
+    for idx, (x, y, confidence) in enumerate(coords):
+        for dx, dy in offsets:
+            nx, ny = x + dx * patch_size, y + dy * patch_size
+            #print(f'{nx},{ny}')
+
+            # Check if the neighbor is within bounds
+            if 0 <= nx < W and 0 <= ny < H:
+                neighbors.append((nx, ny, confidence, idx))
+    # Convert to numpy array
+    neighbors = np.array(neighbors, dtype=np.float32)
+    #print(neighbors.shape)
+
+    # Sort neighbors by coordinates and confidence (descending)
+    neighbors = neighbors[np.lexsort((-neighbors[:, 2], neighbors[:, 1], neighbors[:, 0]))]
+
+    # Remove duplicates by keeping the highest confidence
+    unique_neighbors = []
+    seen_coords = set()
+
+    for x, y, conf, orig_idx in neighbors:
+        coord_key = (x, y)
+        if coord_key not in seen_coords:
+            unique_neighbors.append((x, y, conf, orig_idx))
+            seen_coords.add(coord_key)
+
+    return np.array(unique_neighbors, dtype=np.float32)
+
+def compute_patch_indices(coords, H, W, patch_size=8):
+        """
+        输入:
+        coords: [N, 2] 的张量，每一行为 [x, y]（整数坐标），表示 patch 的中心坐标
+        H, W: 图像高度和宽度
+        patch_size: 每个 patch 的尺寸（默认 8）
+        输出:
+        final_indices: [N] 的张量，每个元素为该原始坐标对应的 patch 序号
+        """
+        # 1. 去除重复的坐标
+        unique_coords, inverse_indices = torch.unique(coords, return_inverse=True, dim=0)
+        # print(unique_coords)
+        
+        # 2. 根据每个唯一坐标计算其所在的网格位置
+        # 行号（row）由 y 值决定，列号（col）由 x 值决定
+        rows = unique_coords[:, 1] // patch_size   # y // patch_size
+        cols = unique_coords[:, 0] // patch_size   # x // patch_size
+        
+        # 图像水平上有多少个 patch
+        num_cols = W // patch_size
+        
+        # 计算网格中该 patch 的序号（从 0 开始），序号 = row * num_cols + col
+        patch_idx = rows * num_cols + cols
+        # print(patch_idx)
+        
+        # 返回唯一的 patch 序号
+        return patch_idx
 
 class Encoder(nn.Module):
     """
@@ -176,7 +260,7 @@ class Regressor(nn.Module):
 
         self.encoder = Encoder(out_channels=self.feature_dim)
         self.superpoint = SuperPointNet()
-        self.heads = Head(mean, num_head_blocks, use_homogeneous, in_channels=heads_in)
+        self.heads = Head(mean, num_head_blocks, use_homogeneous, in_channels=heads_in+256)
 
     @classmethod
     def create_from_encoder(cls, encoder_state_dict, mean, num_head_blocks, use_homogeneous,desc_dim):
@@ -269,19 +353,43 @@ class Regressor(nn.Module):
     def get_scene_coordinates(self, features):
         return self.heads(features)
 
-    def forward(self, inputs ,superpoint):
+    def forward(self, inputs ,pts,desc):
         """
         Forward pass.
         """
+        def normalize_shape(tensor_in):
+            """Bring tensor from shape BxCxHxW to BxNxC"""
+            return tensor_in.flatten(2).transpose(1, 2)
+        B,_,H,W = inputs.shape
         features = self.get_features(inputs)
+        _,_,fH,fW = features.shape
         #print(features.shape)
-        # image_BHW = inputs.squeeze(1)
-        # image_HW = image_BHW.squeeze(0)
-        # image_HW_np = image_HW.cpu().numpy().astype(np.float32)
-        # pts, desc, _ = superpoint.run(image_HW_np)
-        # pts_tensor = torch.from_numpy(pts)
-        # desc_tensor = torch.from_numpy(desc)
-        # pts_tensor = pts_tensor.permute(1,0).to(torch.device("cuda"),non_blocking=True,dtype=features.dtype)
-        # desc_tensor = desc_tensor.permute(1,0).to(torch.device("cuda"),non_blocking=True,dtype=features.dtype)
-
-        return self.get_scene_coordinates(features)
+        image_BHW = inputs.squeeze(1)
+        image_HW = image_BHW.squeeze(0)
+        image_HW_np = image_HW.cpu().numpy().astype(np.float32)
+        pts_tensor = torch.from_numpy(pts)
+        desc_tensor = torch.from_numpy(desc)
+        pts_tensor = pts_tensor.permute(1,0).to(torch.device("cuda"),non_blocking=True,dtype=features.dtype)
+        desc_tensor = desc_tensor.permute(1,0).to(torch.device("cuda"),non_blocking=True,dtype=features.dtype)
+        pts_tensor[:,:2] = (pts_tensor[:,:2]//self.OUTPUT_SUBSAMPLE)*self.OUTPUT_SUBSAMPLE + \
+                            torch.tensor(4,device=pts_tensor.device,dtype=pts_tensor.dtype)
+        pts_np = pts_tensor.cpu().numpy().astype(np.float32)
+        position_confidence_idx = find_neighbors_with_confidence(pts_np,H,W,8,4)
+        position_confidence_idx = torch.from_numpy(position_confidence_idx)
+        patch_idx = compute_patch_indices(position_confidence_idx[:,:2],H,W)
+        patch_idx = patch_idx.to(device=inputs.device,dtype=torch.int)
+        desc_vector = []
+        for idx in position_confidence_idx[:,3]:
+            #print(idx)
+            if idx >= desc_tensor.shape[0]:
+                break
+            desc_vector.append(desc_tensor[idx.to(dtype=torch.int),:].tolist())
+        desc_vector = torch.tensor(desc_vector,device=pts_tensor.device,dtype=pts_tensor.dtype).unsqueeze(0)
+        features_BnC = normalize_shape(features)[:,patch_idx,:]
+        features_BnC = torch.cat([features_BnC,desc_vector],dim=-1)
+        scene_coordinates_BnC = self.get_scene_coordinates(features_BnC.permute(0,2,1).unsqueeze(3))
+        scene_coordinates_BnC = scene_coordinates_BnC.squeeze(3).permute(0,2,1)
+        # scene_coordinates_BNC = normalize_shape(scene_coordinates_BCHW)
+        # scene_coordinates_BNC = scene_coordinates_BNC[:,patch_idx,:]
+        
+        return scene_coordinates_BnC,patch_idx,fH,fW

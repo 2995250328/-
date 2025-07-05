@@ -43,7 +43,7 @@ if __name__ == '__main__':
     parser.add_argument('--training_buffer_size', type=int, default=8000000,
                         help='number of patches in the training buffer')
     
-    parser.add_argument('--onebuffer', type=int, default=4000000,
+    parser.add_argument('--onebuffer', type=int, default=8000000,
                         help='number of patches in the training buffer')
 
     parser.add_argument('--samples_per_image', type=int, default=1024,
@@ -130,7 +130,7 @@ if __name__ == '__main__':
     parser.add_argument('--nms_dist', type=int, default=4,
       help='Non Maximum Suppression (NMS) distance (default: 4).')
     
-    parser.add_argument('--conf_thresh', type=float, default=0.02,
+    parser.add_argument('--conf_thresh', type=float, default=0.0015,
       help='Detector confidence threshold (default: 0.015).')
     
     parser.add_argument('--nn_thresh', type=float, default=0.7,
