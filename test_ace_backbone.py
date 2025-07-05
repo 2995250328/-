@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
+import torchvision.transforms as T
 
 import dsacstar
 from ace_network_backbone import Regressor
@@ -27,6 +28,15 @@ _logger = logging.getLogger(__name__)
 def _strtobool(x):
     return bool(strtobool(x))
 
+patch_h = 50
+patch_w = 50
+
+# DINOv2预处理
+dinov2_transform = T.Compose([
+    T.Resize((patch_h * 14, patch_w * 14)),  # DINOv2默认输入尺寸
+    T.CenterCrop((patch_h * 14, patch_w * 14))
+])
+
 
 if __name__ == '__main__':
     # Setup logging.
@@ -40,6 +50,11 @@ if __name__ == '__main__':
                         help='path to a scene in the dataset folder, e.g. "datasets/Cambridge_GreatCourt"')
 
     parser.add_argument('network', type=Path, help='path to a network trained for the scene (just the head weights)')
+
+    # DINOv2模型版本选择
+    parser.add_argument('--model_version', type=str, default='vits14',
+                        choices=['vits14', 'vitb14', 'vitl14', 'vitg14'],
+                        help='DINOv2 model version to use')
 
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
                         help='file containing pre-trained encoder weights')
@@ -117,6 +132,7 @@ if __name__ == '__main__':
         scene_path / "test",
         mode=0,  # Default for ACE, we don't need scene coordinates/RGB-D.
         image_height=opt.image_resolution,
+        transform=dinov2_transform  # 添加DINOv2的预处理
     )
     _logger.info(f'Test images found: {len(testset)}')
 
@@ -124,13 +140,14 @@ if __name__ == '__main__':
     testset_loader = DataLoader(testset, shuffle=False, num_workers=6)
 
     # Load network weights.
-    encoder_state_dict = torch.load(encoder_path, map_location="cpu")
-    _logger.info(f"Loaded encoder from: {encoder_path}")
     head_state_dict = torch.load(head_network_path, map_location="cpu")
     _logger.info(f"Loaded head weights from: {head_network_path}")
 
     # Create regressor.
-    network = Regressor.create_from_split_state_dict(encoder_state_dict, head_state_dict)
+    network = Regressor.create_from_split_state_dict(
+        model_version=opt.model_version,
+        head_state_dict=head_state_dict
+    )
 
     # Setup for evaluation.
     network = network.to(device)
@@ -198,15 +215,16 @@ if __name__ == '__main__':
     # Testing loop.
     testing_start_time = time.time()
     with torch.no_grad():
-        for image_RGB,image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
+        for image_dino, image_RGB, image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
             batch_start_time = time.time()
             batch_size = image_B1HW.shape[0]
 
             image_B1HW = image_B1HW.to(device, non_blocking=True)
+            image_dino = image_dino.to(device, non_blocking=True)
 
             # Predict scene coordinates.
             with autocast(enabled=True):
-                scene_coordinates_B3HW = network(image_B1HW)
+                scene_coordinates_B3HW = network(image_dino)
 
             # We need them on the CPU to run RANSAC.
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()

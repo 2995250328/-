@@ -14,9 +14,9 @@ import torch
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
-import dsacstarsample
-from ace_network_origin import Regressor
-from dataset import CamLocDataset
+import dsacstar
+from ace_network_overlock import Regressor
+from dataset_overlock import CamLocDataset
 
 import ace_vis_util as vutil
 from ace_visualizer import ACEVisualizer
@@ -40,6 +40,11 @@ if __name__ == '__main__':
                         help='path to a scene in the dataset folder, e.g. "datasets/Cambridge_GreatCourt"')
 
     parser.add_argument('network', type=Path, help='path to a network trained for the scene (just the head weights)')
+
+    # OverLoCK模型版本选择
+    parser.add_argument('--model_version', type=str, default='overlock_t',
+                        choices=['overlock_t', 'overlock_s', 'overlock_b'],
+                        help='OverLoCK model version to use')
 
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
                         help='file containing pre-trained encoder weights')
@@ -117,6 +122,7 @@ if __name__ == '__main__':
         scene_path / "test",
         mode=0,  # Default for ACE, we don't need scene coordinates/RGB-D.
         image_height=opt.image_resolution,
+        augment=False  # 测试时不使用数据增强
     )
     _logger.info(f'Test images found: {len(testset)}')
 
@@ -124,13 +130,14 @@ if __name__ == '__main__':
     testset_loader = DataLoader(testset, shuffle=False, num_workers=6)
 
     # Load network weights.
-    encoder_state_dict = torch.load(encoder_path, map_location="cpu", weights_only=True)
-    _logger.info(f"Loaded encoder from: {encoder_path}")
-    head_state_dict = torch.load(head_network_path, map_location="cpu", weights_only=True)
+    head_state_dict = torch.load(head_network_path, map_location="cpu")
     _logger.info(f"Loaded head weights from: {head_network_path}")
 
     # Create regressor.
-    network = Regressor.create_from_split_state_dict(encoder_state_dict, head_state_dict)
+    network = Regressor.create_from_split_state_dict(
+        model_version=opt.model_version,
+        head_state_dict=head_state_dict
+    )
 
     # Setup for evaluation.
     network = network.to(device)
@@ -181,6 +188,7 @@ if __name__ == '__main__':
             scene_path / "train",
             mode=0,  # Default for ACE, we don't need scene coordinates/RGB-D.
             image_height=opt.image_resolution,
+            augment=False
         )
 
         # Setup dataloader. Batch size 1 by default.
@@ -198,15 +206,16 @@ if __name__ == '__main__':
     # Testing loop.
     testing_start_time = time.time()
     with torch.no_grad():
-        for image_RGB,image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
+        for image_RGB_raw, image_RGB, image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
             batch_start_time = time.time()
             batch_size = image_B1HW.shape[0]
 
             image_B1HW = image_B1HW.to(device, non_blocking=True)
+            image_RGB = image_RGB.to(device, non_blocking=True)
 
             # Predict scene coordinates.
-            with torch.amp.autocast('cuda', enabled=True):
-                scene_coordinates_B3HW = network(image_B1HW)
+            with autocast(enabled=True):
+                scene_coordinates_B3HW = network(image_RGB)
 
             # We need them on the CPU to run RANSAC.
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
@@ -228,19 +237,10 @@ if __name__ == '__main__':
                 # Allocate output variable.
                 out_pose = torch.zeros((4, 4))
 
-                                # --- 添加调试打印语句 ---
-                print(f"DEBUG: Shape of scene_coordinates_3HW before unsqueeze: {scene_coordinates_3HW.shape}") 
-                if isinstance(out_pose, torch.Tensor):
-                    print(f"DEBUG: Shape of out_pose: {out_pose.shape}")
-                else:
-                    print(f"DEBUG: Type of out_pose: {type(out_pose)}")
-                
-                # 注意：其他参数如 opt.hypotheses, opt.threshold, focal_length 等在 C++ 签名中是 int 或 float 类型，
-                # 通常不会引起 TensorAccessor 错误。
-
-                inlier_count = dsacstarsample.forward_rgb(
+                # Compute the pose via RANSAC.
+                inlier_count = dsacstar.forward_rgb(
                     scene_coordinates_3HW.unsqueeze(0),
-                    out_pose, # 保持不变，我们将根据打印输出决定是否修改
+                    out_pose,
                     opt.hypotheses,
                     opt.threshold,
                     focal_length,

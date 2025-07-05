@@ -380,55 +380,49 @@ class CamLocDataset(Dataset):
         return pose
 
     def _random_crop(self, image, centre_point, focal_length):
-        """随机裁剪图像并调整相机内参
-        
+        """以图像中心为基准随机裁剪图像，并调整相机内参
+
         Args:
-            image: 图像(numpy数组或PIL图像)
+            image: 图像（numpy数组或PIL图像）
             centre_point: 相机主点坐标 [cx, cy]
             focal_length: 相机焦距 [fx, fy]
-            
+
         Returns:
             cropped_image: 裁剪后的PIL图像
-            new_centre_point: 调整后的主点坐标
-            new_focal_length: 调整后的焦距
+            new_centre_point: 裁剪后调整的主点坐标
+            new_focal_length: 裁剪后焦距（不变）
         """
-        # 如果输入是numpy数组，转换为PIL图像
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
-            
-        # 获取原始图像尺寸
+
         orig_w, orig_h = image.size
-        
-        # 计算最小裁剪尺寸
+
+        # 计算随机裁剪尺寸（范围：[min_crop_ratio, 1.0] * 原图尺寸）
         min_w = int(orig_w * self.min_crop_ratio)
         min_h = int(orig_h * self.min_crop_ratio)
-        
-        # 随机选择裁剪尺寸
         crop_w = random.randint(min_w, orig_w)
         crop_h = random.randint(min_h, orig_h)
-        
-        # 随机选择裁剪起点
-        left = random.randint(0, orig_w - crop_w)
-        top = random.randint(0, orig_h - crop_h)
-        
-        # 执行裁剪
+
+        # 计算中心裁剪的起点
+        center_x = orig_w // 2
+        center_y = orig_h // 2
+        left = max(0, center_x - crop_w // 2)
+        top = max(0, center_y - crop_h // 2)
+
+        # 裁剪图像
         cropped_image = TF.crop(image, top, left, crop_h, crop_w)
-        
-        # 调整相机内参
+
+        # 调整相机主点位置
         if centre_point is not None:
-            # 调整主点坐标
             new_centre_point = [
                 centre_point[0] - left,
                 centre_point[1] - top
             ]
-            # 焦距保持不变
-            new_focal_length = focal_length
         else:
-            # 如果没有提供主点坐标，则使用图像中心
             new_centre_point = None
-            new_focal_length = focal_length
-            
-        return cropped_image, new_centre_point, new_focal_length
+
+        return cropped_image, new_centre_point, focal_length
+
 
     def _get_single_item(self, idx, image_height):
         # Apply index indirection.

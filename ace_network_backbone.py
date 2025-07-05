@@ -102,8 +102,9 @@ class Encoder(nn.Module):
         
         # 重塑为空间特征图
         concat_features = concat_features.transpose(1, 2).reshape(B, 2*C, H, W)
+        patch_features = patch_features.transpose(1, 2).reshape(B, C, H, W)
         
-        return concat_features, attention_weights
+        return patch_features, attention_weights
 
 
 class Head(nn.Module):
@@ -235,7 +236,7 @@ class Regressor(nn.Module):
         """
         # 根据模型版本确定特征维度
         if model_version == 'vits14':
-            num_encoder_features = 768  # DINOv2-vits14拼接后的特征维度
+            num_encoder_features = 768//2  # DINOv2-vits14拼接后的特征维度
         elif model_version == 'vitb14':
             num_encoder_features = 1536  # DINOv2-vitb14拼接后的特征维度
         elif model_version == 'vitl14':
@@ -269,7 +270,7 @@ class Regressor(nn.Module):
         use_homogeneous = state_dict["heads.fc3.weight"].shape[0] == 4
 
         # 对于DINOv2,我们使用固定的特征维度
-        num_encoder_features = 768  # DINOv2拼接后的特征维度
+        num_encoder_features = 768//2  # DINOv2拼接后的特征维度
 
         # Create a regressor.
         _logger.info(f"Creating regressor from pretrained state_dict:"
@@ -285,18 +286,53 @@ class Regressor(nn.Module):
         return regressor
 
     @classmethod
-    def create_from_split_state_dict(cls, encoder_state_dict, head_state_dict):
+    def create_from_split_state_dict(cls, model_version, head_state_dict):
         """
         Instantiate a regressor from a pretrained encoder (scene-agnostic) and a scene-specific head.
 
-        encoder_state_dict: encoder state dictionary
+        model_version: DINOv2 model version ('vits14', 'vitb14', 'vitl14', 'vitg14')
         head_state_dict: scene-specific head state dictionary
         """
-        # 对于DINOv2,我们不需要合并encoder的state_dict
-        # 因为DINOv2模型是通过torch.hub直接加载的
+        merged_state_dict = {}
+        for k, v in head_state_dict.items():
+            merged_state_dict[f"heads.{k}"] = v
+        # 根据模型版本确定特征维度
+        if model_version == 'vits14':
+            num_encoder_features = 768//2  # DINOv2-vits14拼接后的特征维度
+        elif model_version == 'vitb14':
+            num_encoder_features = 1536  # DINOv2-vitb14拼接后的特征维度
+        elif model_version == 'vitl14':
+            num_encoder_features = 2048  # DINOv2-vitl14拼接后的特征维度
+        elif model_version == 'vitg14':
+            num_encoder_features = 3072  # DINOv2-vitg14拼接后的特征维度
+        else:
+            raise ValueError(f"Unsupported DINOv2 model version: {model_version}")
+
+        # Count how many head blocks are in the dictionary.
+        pattern = re.compile(r"^heads\.\d+c0\.weight$")
+        num_head_blocks = sum(1 for k in merged_state_dict.keys() if pattern.match(k))
+
+        # Whether the network uses homogeneous coordinates.
+        use_homogeneous = merged_state_dict["heads.fc3.weight"].shape[0] == 4
+
+        # Create a regressor.
+        _logger.info(f"Creating regressor with DINOv2-{model_version}:"
+                     f"\n\tNum head blocks: {num_head_blocks}"
+                     f"\n\tHomogeneous coordinates: {use_homogeneous}"
+                     f"\n\tEncoder feature size: {num_encoder_features}")
         
-        # 我们只需要使用head的state_dict
-        return cls.create_from_state_dict(head_state_dict)
+        regressor = cls(
+            mean=torch.zeros(3),  # 使用零均值
+            num_head_blocks=num_head_blocks,
+            use_homogeneous=use_homogeneous,
+            num_encoder_features=num_encoder_features,
+            model_version=model_version
+        )
+
+        # Load head weights
+        regressor.heads.load_state_dict(head_state_dict)
+
+        return regressor
 
     def load_encoder(self, encoder_dict_file):
         """
@@ -316,5 +352,5 @@ class Regressor(nn.Module):
         """
         Forward pass.
         """
-        features = self.get_features(inputs)
+        features,_ = self.get_features(inputs)
         return self.get_scene_coordinates(features)

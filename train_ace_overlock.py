@@ -6,7 +6,7 @@ import logging
 from distutils.util import strtobool
 from pathlib import Path
 
-from ace_trainer_backbone import TrainerACE
+from ace_trainer_overlock import TrainerACE
 
 
 def _strtobool(x):
@@ -28,10 +28,10 @@ if __name__ == '__main__':
     parser.add_argument('output_map_file', type=Path,
                         help='target file for the trained network')
     
-    # DINOv2模型版本选择
-    parser.add_argument('--model_version', type=str, default='vits14',
-                        choices=['vits14', 'vitb14', 'vitl14', 'vitg14'],
-                        help='DINOv2 model version to use')
+    # OverLoCK模型版本选择
+    parser.add_argument('--model_version', type=str, default='overlock_t',
+                        choices=['overlock_t', 'overlock_s', 'overlock_b'],
+                        help='OverLoCK model version to use')
 
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
                         help='file containing pre-trained encoder weights')

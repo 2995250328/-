@@ -307,7 +307,7 @@ class TrainerACE:
 
                     # Compute image features.
                     with autocast('cuda', enabled=self.options.use_half):
-                        features_BCHW, attention_weights = self.regressor.get_features(image_dino)
+                        features_BCHW , attention_weights = self.regressor.get_features(image_dino)
 
                     # Dimensions after the network's downsampling.
                     B, C, H, W = features_BCHW.shape
@@ -344,39 +344,70 @@ class TrainerACE:
                     intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
                     intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
                     
-                    # 将特征和像素坐标展平
-                    features_flat = features_BCHW.reshape(B, C, -1).transpose(1, 2)  # [B, H*W, C]
-                    pixel_positions_flat = pixel_positions_B2HW.reshape(B, 2, -1).transpose(1, 2)  # [B, H*W, 2]
+                    # # 将特征和像素坐标展平
+                    # features_flat = features_BCHW.reshape(B, C, -1).transpose(1, 2)  # [B, H*W, C]
+                    # pixel_positions_flat = pixel_positions_B2HW.reshape(B, 2, -1).transpose(1, 2)  # [B, H*W, 2]
                     
-                    # 选择注意力最高的特征和对应的像素坐标
-                    selected_features = []
-                    selected_pixels = []
-                    selected_poses = []
-                    selected_intrinsics = []
-                    selected_intrinsics_inv = []
+                    # # 选择注意力最高的特征和对应的像素坐标
+                    # selected_features = []
+                    # selected_pixels = []
+                    # selected_poses = []
+                    # selected_intrinsics = []
+                    # selected_intrinsics_inv = []
                     
-                    for b in range(B):
-                        batch_indices = top_indices[b]
-                        selected_features.append(features_flat[b, batch_indices])
-                        selected_pixels.append(pixel_positions_flat[b, batch_indices])
-                        selected_poses.append(gt_pose_inv[batch_indices])
-                        selected_intrinsics.append(intrinsics[batch_indices])
-                        selected_intrinsics_inv.append(intrinsics_inv[batch_indices])
+                    # for b in range(B):
+                    #     batch_indices = top_indices[b]
+                    #     selected_features.append(features_flat[b, batch_indices])
+                    #     selected_pixels.append(pixel_positions_flat[b, batch_indices])
+                    #     selected_poses.append(gt_pose_inv[batch_indices])
+                    #     selected_intrinsics.append(intrinsics[batch_indices])
+                    #     selected_intrinsics_inv.append(intrinsics_inv[batch_indices])
                     
-                    # 合并所有batch的结果
-                    selected_features = torch.cat(selected_features, dim=0)
-                    selected_pixels = torch.cat(selected_pixels, dim=0)
-                    selected_poses = torch.cat(selected_poses, dim=0)
-                    selected_intrinsics = torch.cat(selected_intrinsics, dim=0)
-                    selected_intrinsics_inv = torch.cat(selected_intrinsics_inv, dim=0)
+                    # # 合并所有batch的结果
+                    # selected_features = torch.cat(selected_features, dim=0)
+                    # selected_pixels = torch.cat(selected_pixels, dim=0)
+                    # selected_poses = torch.cat(selected_poses, dim=0)
+                    # selected_intrinsics = torch.cat(selected_intrinsics, dim=0)
+                    # selected_intrinsics_inv = torch.cat(selected_intrinsics_inv, dim=0)
                     
-                    # 写入训练缓冲区
+                    # # 写入训练缓冲区
+                    # buffer_offset = buffer_idx + features_to_select
+                    # self.training_buffer['features'][buffer_idx:buffer_offset] = selected_features
+                    # self.training_buffer['target_px'][buffer_idx:buffer_offset] = selected_pixels
+                    # self.training_buffer['gt_poses_inv'][buffer_idx:buffer_offset] = selected_poses
+                    # self.training_buffer['intrinsics'][buffer_idx:buffer_offset] = selected_intrinsics
+                    # self.training_buffer['intrinsics_inv'][buffer_idx:buffer_offset] = selected_intrinsics_inv
+
+                    def normalize_shape(tensor_in):
+                        """Bring tensor from shape BxCxHxW to NxC"""
+                        return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
+
+                    batch_data = {
+                        'features': normalize_shape(features_BCHW),
+                        'target_px': normalize_shape(pixel_positions_B2HW),
+                        'gt_poses_inv': gt_pose_inv,
+                        'intrinsics': intrinsics,
+                        'intrinsics_inv': intrinsics_inv
+                    }
+
+                    # Turn image mask into sampling weights (all equal).
+                    image_mask_B1HW = image_mask_B1HW.float()
+                    image_mask_N1 = normalize_shape(image_mask_B1HW)
+
+                    # Sample indices uniformly, with replacement.
+                    sample_idxs = torch.multinomial(image_mask_N1.view(-1),
+                                                    features_to_select,
+                                                    replacement=True,
+                                                    generator=self.sampling_generator)
+
+                    # Select the data to put in the buffer.
+                    for k in batch_data:
+                        batch_data[k] = batch_data[k][sample_idxs]
+
+                    # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
                     buffer_offset = buffer_idx + features_to_select
-                    self.training_buffer['features'][buffer_idx:buffer_offset] = selected_features
-                    self.training_buffer['target_px'][buffer_idx:buffer_offset] = selected_pixels
-                    self.training_buffer['gt_poses_inv'][buffer_idx:buffer_offset] = selected_poses
-                    self.training_buffer['intrinsics'][buffer_idx:buffer_offset] = selected_intrinsics
-                    self.training_buffer['intrinsics_inv'][buffer_idx:buffer_offset] = selected_intrinsics_inv
+                    for k in batch_data:
+                        self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
                     
                     buffer_idx = buffer_offset
                     print(f'\r{buffer_idx}/{self.options.onebuffer}', end="")
@@ -488,7 +519,9 @@ class TrainerACE:
         loss /= batch_size
 
         # We need to check if the step actually happened, since the scaler might skip optimisation steps.
-        old_optimizer_step = self.optimizer._step_count
+        old_optimizer_step = 0
+        if len(self.optimizer.state_dict()['state']) > 0:
+            old_optimizer_step = next(iter(self.optimizer.state_dict()['state'].values()))['step']
 
         # Optimization steps.
         self.optimizer.zero_grad(set_to_none=True)
@@ -500,7 +533,6 @@ class TrainerACE:
             # Print status.
             time_since_start = time.time() - self.training_start
             fraction_valid = float(valid_mask_b1.sum() / batch_size)
-            # median_depth = float(pred_cam_coords_b31[:, 2].median())
 
             _logger.info(f'Iteration: {self.iteration:6d} / Epoch {self.epoch:03d}|{self.options.epochs:03d}, '
                          f'Loss: {loss:.1f}, Valid: {fraction_valid * 100:.1f}%, Time: {time_since_start:.2f}s')
@@ -511,7 +543,11 @@ class TrainerACE:
                 self.ace_visualizer.render_mapping_frame(vis_scene_coords, vis_errors)
 
         # Only step if the optimizer stepped and if we're not over-stepping the total_steps supported by the scheduler.
-        if old_optimizer_step < self.optimizer._step_count < self.scheduler.total_steps:
+        current_step = 0
+        if len(self.optimizer.state_dict()['state']) > 0:
+            current_step = next(iter(self.optimizer.state_dict()['state'].values()))['step']
+        
+        if old_optimizer_step < current_step < self.scheduler.total_steps:
             self.scheduler.step()
 
     def save_model(self):

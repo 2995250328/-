@@ -11,7 +11,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 import dsacstarsample
@@ -226,7 +226,7 @@ if __name__ == '__main__':
             image_B1HW = image_B1HW.to(device, non_blocking=True)
 
             # Predict scene coordinates.
-            with autocast(enabled=True):
+            with autocast('cuda', enabled=True):
                 #############################
                 # scene_coordinates_B3HW,scene_coordinates_BN3,patch_idx,fH,fW = network(image_B1HW,superpoint)
                 #############################
@@ -265,38 +265,9 @@ if __name__ == '__main__':
                 ##########################################################
                 
                 # Compute the pose via RANSAC.   
-                # ##########################################################       
-                # inlier_count = dsacstarsample.forward_sequence_rgb(
-                #     scene_coordinates_N3,
-                #     points_2d,
-                #     inliers,
-                #     out_pose,
-                #     4,
-                #     focal_length,
-                #     ppX,
-                #     ppY,                   
-                #     opt.maxpixelerror                   
-                # )
-                # good_estimation = inlier_count >= 20
-                # if good_estimation:
-                #     print("The estimation is good.")
-                # else:
-                #     print("The estimation is bad.")
-                #     inlier_count = dsacstarsample.forward_rgb(
-                #     scene_coordinates_3HW.unsqueeze(0),
-                #     out_pose,
-                #     opt.hypotheses,
-                #     opt.threshold,
-                #     focal_length,
-                #     ppX,
-                #     ppY,
-                #     opt.inlieralpha,
-                #     opt.maxpixelerror,
-                #     network.OUTPUT_SUBSAMPLE,
-                #     )       
-                # ##########################################################    
+                print(scene_coordinates_3HW.shape)
                 inlier_count = dsacstarsample.forward_rgb(
-                    scene_coordinates_3HW.unsqueeze(0),
+                    scene_coordinates_3HW.unsqueeze(0),  # 添加batch维度 [1, 3, 60, 80]
                     out_pose,
                     opt.hypotheses,
                     opt.threshold,
@@ -306,7 +277,7 @@ if __name__ == '__main__':
                     opt.inlieralpha,
                     opt.maxpixelerror,
                     network.OUTPUT_SUBSAMPLE,
-                    ) 
+                )
 
                 # Calculate translation error.
                 t_err = float(torch.norm(gt_pose_44[0:3, 3] - out_pose[0:3, 3]))
