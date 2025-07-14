@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from superpoint import SuperPointNet
 from depth_anything_v2.dpt import DepthAnythingV2
+from transformers import pipeline
 
 _logger = logging.getLogger(__name__)
 
@@ -29,6 +30,41 @@ class RelativeDepthLoss(nn.Module):
         self.register_buffer('alpha', None)
         self.register_buffer('beta', None)
         self.register_buffer('pred_aligned', None)
+
+    def edge_aware_smooth_loss(img, disp):
+        """
+        计算边缘感知的平滑损失。
+
+        Args:
+            img (torch.Tensor): 输入的RGB图像，形状为 (B, 3, H, W)，B是批量大小。
+            disp (torch.Tensor): 预测的视差或深度图，形状为 (B, 1, H, W)。
+
+        Returns:
+            torch.Tensor: 一个标量（0维张量），代表该批次的平均损失。
+        """
+        
+        # 1. 计算图像和视差图的梯度
+        # 使用与Sobel算子等效的卷积核来计算x和y方向的梯度
+        grad_disp_x = torch.abs(disp[:, :, :, :-1] - disp[:, :, :, 1:])
+        grad_disp_y = torch.abs(disp[:, :, :-1, :] - disp[:, :, 1:, :])
+
+        grad_img_x = torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]), 1, keepdim=True)
+        grad_img_y = torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]), 1, keepdim=True)
+
+        # 2. 计算权重
+        # 图像梯度越大的地方（边缘），权重越小
+        weight_x = torch.exp(-grad_img_x)
+        weight_y = torch.exp(-grad_img_y)
+
+        # 3. 计算加权后的平滑度损失
+        # 将深度/视差图的梯度乘以相应的权重
+        # 注意：这里的grad_disp和weight的尺寸需要对齐
+        # 我们需要裁剪掉梯度计算中无法覆盖的最后一行/列
+        smoothness_x = grad_disp_x * weight_x[:, :, :, :-1]
+        smoothness_y = grad_disp_y * weight_y[:, :, :-1, :]
+        
+        # 4. 返回所有像素损失的平均值
+        return torch.mean(smoothness_x) + torch.mean(smoothness_y)
 
     def compute_scale_shift(self, pred, target, mask):
         """
@@ -133,7 +169,7 @@ class RelativeDepthLoss(nn.Module):
         H, W = depth1_aligned.shape
         flat_depth1 = depth1_aligned.view(-1)  # [HW]
         flat_depth2 = depth2.view(-1)
-        flat_mask = mask.view(-1)
+        flat_mask = mask.reshape(-1)
         
         # 计算元素间差值
         diff1 = flat_depth1.unsqueeze(1) - flat_depth1.unsqueeze(0)  # [HW,HW]
@@ -156,13 +192,14 @@ class RelativeDepthLoss(nn.Module):
         
         return diff / spatial_dist, valid_mask
 
-    def forward(self, pred_depth, gt_depth, valid_mask):
+    def forward(self, pred_depth, gt_depth, valid_mask, image):
         """
         前向计算总损失
         参数:
             pred_depth: 预测深度图 (H x W)
             gt_depth: 真值深度图 (H x W)
             valid_mask: 有效区域掩码 (H x W)
+            image: 原始图像
         返回:
             total_loss: 总损失值
         """       

@@ -14,7 +14,6 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 from torch.utils.data import sampler
 import torchvision.transforms as T
-from torchview import draw_graph
 
 from ace_util import get_pixel_grid, to_homogeneous
 from ace_loss import ReproLoss
@@ -110,8 +109,6 @@ class TrainerACE:
         )
         _logger.info(f"Loaded pretrained encoder from: {self.options.encoder_path}")
         # summary(self.regressor.encoder, (1, 3, 700, 700))
-        model_graph = draw_graph(self.regressor.encoder, input_size=(1, 3, 700, 700), expand_nested=True)
-        model_graph.visual_graph.render("model_structure", format="png")
 
         self.regressor = self.regressor.to(self.device)
         self.regressor.train()

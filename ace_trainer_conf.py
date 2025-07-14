@@ -15,7 +15,7 @@ from torch.utils.data import sampler
 
 from ace_util import get_pixel_grid, to_homogeneous
 from ace_loss import ReproLoss
-from ace_network_origin import Regressor
+from ace_network_conf import Regressor
 from dataset import CamLocDataset
 
 import ace_vis_util as vutil
@@ -405,10 +405,11 @@ class TrainerACE:
         # Reshape to a "fake" BCHW shape, since it's faster to run through the network compared to the original shape.
         features_bCHW = features_bC[None, None, ...].view(-1, 16, 32, channels).permute(0, 3, 1, 2)
         with autocast(enabled=self.options.use_half):
-            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
+            pred_scene_coords_b3HW ,pred_log_variance_b1HW= self.regressor.get_scene_coordinates(features_bCHW)
 
         # Back to the original shape. Convert to float32 as well.
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        pred_log_variance_b11 = pred_log_variance_b1HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
 
         # Make 3D points homogeneous so that we can easily matrix-multiply them.
         pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
@@ -460,6 +461,7 @@ class TrainerACE:
 
         # Final loss is the sum of all 2.
         loss = loss_valid + loss_invalid
+        loss = torch.exp(-pred_log_variance_b11.squeeze()) * loss + pred_log_variance_b11.squeeze()
         loss /= batch_size
 
         # We need to check if the step actually happened, since the scaler might skip optimisation steps.

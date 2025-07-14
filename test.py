@@ -1,167 +1,260 @@
-#!/usr/bin/env python3
-# Copyright © Niantic, Inc. 2022.
-import logging
-import random
-import time
-import cv2
-import matplotlib
-from tqdm import *
-from skimage import color
-from skimage import io
-from skimage.transform import rotate, resize
-
-import numpy as np
 import torch
-import torch.optim as optim
-import torchvision.transforms.functional as TF
-from torch.utils.data import DataLoader
-from torch.utils.data import sampler
-
-from dataset import CamLocDataset
-import argparse
-from distutils.util import strtobool
-from pathlib import Path
+from PIL import Image
+import numpy as np
 import matplotlib.pyplot as plt
-def _strtobool(x):
-    return bool(strtobool(x))
+from distillanydepth.modeling.archs.dam.dam import DepthAnything
+from distillanydepth.depth_anything_v2.dpt import DepthAnythingV2
+from distillanydepth.utils.image_util import chw2hwc, colorize_depth_maps
+from distillanydepth.midas.transforms import Resize, NormalizeImage, PrepareForNet
+from torchvision import transforms
+import cv2
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+from dataset import CamLocDataset
+from pathlib import Path
+from torch.utils.data import DataLoader
 
-if __name__ == '__main__':
-    # Setup logging levels.
-    logging.basicConfig(level=logging.INFO)
+# 直接使用固定参数初始化数据集
+dataset = CamLocDataset(
+    root_dir=Path("datasets/pgt_7scenes_pumpkin") / "train",
+    mode=0,  # Default for ACE, we don't need scene coordinates/RGB-D.
+    use_half=True,
+    image_height=480,
+    augment=True,
+    aug_rotation=15,
+    aug_scale_max=1.5,
+    aug_scale_min=1 / 1.5,
+    num_clusters=None,  # Optional clustering for Cambridge experiments.
+    cluster_idx=None,    # Optional clustering for Cambridge experiments.
+)
 
-    # Setup logging levels.
-    logging.basicConfig(level=logging.INFO)
+# 创建数据加载器
+dataloader = DataLoader(
+    dataset=dataset,
+    batch_size=1,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
+)
 
-    parser = argparse.ArgumentParser(
-        description='Fast training of a scene coordinate regression network.',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+def process_image(image, model_size="large"):
+    """处理图像并提取深度图"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 确保图像尺寸是14的倍数
+    h, w = image.shape[-2:]  # 获取图像的高度和宽度
+    new_h = ((h + 13) // 14) * 14  # 向上取整到最近的14的倍数
+    new_w = ((w + 13) // 14) * 14  # 向上取整到最近的14的倍数
+    
+    # 图像预处理 - 转换为float并归一化
+    if image.dtype != torch.float32:
+        image = image.float()
+    
+    # 如果图像值在0-255范围内，归一化到0-1
+    if image.max() > 1.0:
+        print('大于')
+        image = image / 255.0
+    
+    image_tensor = image.to(device)
+    print(image_tensor.shape)
+    
+    # 模型配置
+    model_kwargs = {
+        "large": dict(
+            encoder="vitl", 
+            features=256, 
+            out_channels=[256, 512, 1024, 1024], 
+            use_bn=False, 
+            use_clstoken=False, 
+            max_depth=150.0, 
+            mode='disparity',
+            pretrain_type='dinov2',
+            del_mask_token=False
+        ),
+        "base": dict(
+            encoder='vitb',
+            features=128,
+            out_channels=[96, 192, 384, 768],
+        ),
+        "small": dict(
+            encoder='vits',
+            features=64,
+            out_channels=[48, 96, 192, 384],
+        )
+    }
+    
+    # 加载模型
+    checkpoint_path = hf_hub_download(repo_id=f"xingyang1/Distill-Any-Depth", filename=f"small/model.safetensors", repo_type="model")
+    
+    if model_size == "large":
+        model = DepthAnything(**model_kwargs[model_size]).to(device)
+    else:
+        model = DepthAnythingV2(**model_kwargs[model_size]).to(device)
+    
+    model_weights = load_file(checkpoint_path)
+    model.load_state_dict(model_weights)
+    model.eval()
+    
+    # 推理
+    with torch.no_grad():
+        pred_disp, _ = model(image_tensor)
+    
+    # 处理深度图
+    pred_disp_np = pred_disp.cpu().detach().numpy()[0, 0, :, :]
+    pred_disp = (pred_disp_np - pred_disp_np.min()) / (pred_disp_np.max() - pred_disp_np.min())
+    
+    # 着色
+    cmap = "Spectral_r"
+    depth_colored = colorize_depth_maps(pred_disp[None, ..., None], 0, 1, cmap=cmap).squeeze()
+    depth_colored = (depth_colored * 255).astype(np.uint8)
+    depth_colored_hwc = chw2hwc(depth_colored)
+    
+    # 调整尺寸回原始尺寸
+    depth_colored_hwc = cv2.resize(depth_colored_hwc, (w, h), cv2.INTER_LINEAR)
+    
+    # 确保返回的图像格式正确
+    original_image = image.cpu().numpy()
+    if len(original_image.shape) == 4:  # 如果是4D (B, C, H, W)
+        original_image = original_image[0]  # 取第一个batch
+    if original_image.shape[0] == 3:  # CHW格式
+        original_image = np.transpose(original_image, (1, 2, 0))  # 转换为HWC格式
+    
+    return original_image, depth_colored_hwc
 
-    parser.add_argument('scene', type=Path,
-                        help='path to a scene in the dataset folder, e.g. "datasets/Cambridge_GreatCourt"')
-
-    parser.add_argument('--batch_size', type=int, default=5120,
-                        help='number of patches for each parameter update (has to be a multiple of 512)')
-
-    parser.add_argument('--use_half', type=_strtobool, default=True,
-                        help='train with half precision')
-
-    parser.add_argument('--use_homogeneous', type=_strtobool, default=True,
-                        help='train with half precision')
-
-    parser.add_argument('--use_aug', type=_strtobool, default=True,
-                        help='Use any augmentation.')
-
-    parser.add_argument('--aug_rotation', type=int, default=15,
-                        help='max inplane rotation angle')
-
-    parser.add_argument('--aug_scale', type=float, default=1.5,
-                        help='max scale factor')
-
-    parser.add_argument('--image_resolution', type=int, default=480,
-                        help='base image resolution')
-
-    # Clustering params, for the ensemble training used in the Cambridge experiments. Disabled by default.
-    parser.add_argument('--num_clusters', type=int, default=None,
-                        help='split the training sequence in this number of clusters. disabled by default')
-
-    parser.add_argument('--cluster_idx', type=int, default=None,
-                        help='train on images part of this cluster. required only if --num_clusters is set.')
-
-
-
-    options = parser.parse_args()
-    dataset = CamLocDataset(
-        root_dir=options.scene / "train",
-        mode=1,  # Default for ACE, we don't need scene coordinates/RGB-D.
-        use_half=options.use_half,
-        image_height=options.image_resolution,
-        augment=options.use_aug,
-        aug_rotation=options.aug_rotation,
-        aug_scale_max=options.aug_scale,
-        aug_scale_min=1 / options.aug_scale,
-        num_clusters=options.num_clusters,  # Optional clustering for Cambridge experiments.
-        cluster_idx=options.cluster_idx,    # Optional clustering for Cambridge experiments.
-    )
-
-    batch_generator = torch.Generator()
-    batch_generator.manual_seed(1023)
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(1564)
-    batch_sampler = sampler.BatchSampler(sampler.RandomSampler(dataset, generator=batch_generator),
-                                                batch_size=1,
-                                                drop_last=False)
-
-    def seed_worker(worker_id):
-                # Different seed per epoch. Initial seed is generated by the main process consuming one random number from
-                # the dataloader generator.
-                worker_seed = torch.initial_seed() % 2 ** 32
-                np.random.seed(worker_seed)
-                random.seed(worker_seed)
-
-    training_dataloader = DataLoader(dataset=dataset,
-                                        sampler=batch_sampler,
-                                        batch_size=None,
-                                        worker_init_fn=seed_worker,
-                                        generator=loader_generator,
-                                        pin_memory=True,
-                                        num_workers=12,
-                                        persistent_workers=12 > 0,
-                                        timeout=60 if 12 > 0 else 0,
-                                        )
-    def tensor_to_image(tensor):
-        """将PyTorch张量转换为Matplotlib可显示的格式"""
-        if tensor.is_cuda:
-            tensor = tensor.cpu()  # 转移到CPU
-        # print(tensor)
-        image = tensor.permute(1, 2, 0).numpy().astype(np.uint8)  # 调整维度顺序为 HWC
-        # print(image.size)
-        # 逆归一化（假设使用ImageNet归一化参数）
-        return image  # 确保像素值在[0,1]范围
-    def tensor_to_grayscale_image(tensor):
-        # 1. 反向归一化: tensor = (original - mean) / std
-        mean = torch.tensor([0.4])
-        std = torch.tensor([0.25])
-        tensor = tensor * std + mean  # 还原到 [0,1] 附近
+def resize_to_multiple_of_14(tensor):
+    """调整tensor尺寸到14的倍数"""
+    if tensor.dim() == 4:  # (B, C, H, W)
+        _, _, h, w = tensor.shape
+    elif tensor.dim() == 3:  # (C, H, W)
+        _, h, w = tensor.shape
+    else:
+        return tensor
+    
+    new_h = ((h + 13) // 14) * 14  # 向上取整到最近的14的倍数
+    new_w = ((w + 13) // 14) * 14  # 向上取整到最近的14的倍数
+    
+    if new_h != h or new_w != w:
+        # 确保输入是4D tensor (N, C, H, W)
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)  # 添加batch维度
         
-        # 2. 裁剪到 [0,1] 范围（防止数值溢出）
-        tensor = torch.clamp(tensor, 0, 1)
+        # 根据数据类型选择插值模式
+        if tensor.dtype == torch.bool:
+            # 布尔类型使用nearest插值
+            tensor = torch.nn.functional.interpolate(
+                tensor.float(),  # 转换为float进行插值
+                size=(new_h, new_w), 
+                mode='nearest'
+            ).bool()  # 转换回bool
+        else:
+            # 其他类型使用bilinear插值
+            tensor = torch.nn.functional.interpolate(
+                tensor, 
+                size=(new_h, new_w), 
+                mode='bilinear', 
+                align_corners=False
+            )
         
-        # 3. 移除通道维度并转为 numpy
-        image = tensor.squeeze(0).numpy()  # 形状 (H, W)
-        return image
-    cmap = matplotlib.colormaps.get_cmap('Spectral_r')
-    rootdir = options.scene / "train"
-    coord_dir = rootdir / 'depth'
-    coord_files = sorted(coord_dir.iterdir())
-    depth = io.imread(coord_files[0])
-    depth = depth.astype(np.float64)
-    depth /= 1000  # from millimeters to meters
-    depth = (cmap(depth)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
-    cv2.namedWindow("Combined Image", cv2.WINDOW_NORMAL)
-    cv2.imshow("Combined Image", depth)
-    print(depth)
-    key = cv2.waitKey(0)
-    if key == 27:  
-        cv2.destroyAllWindows()
+        # 如果原来是3D，去掉batch维度
+        if tensor.shape[0] == 1 and tensor.dim() == 3:
+            tensor = tensor.squeeze(0)
+    
+    return tensor
 
-    # for image_RGB,depth,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
-    #         # fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    #         # print(image_RGB.shape,image_B1HW.shape)
-    #         # 深度图可视化
-    #         print(depth)
-            # pred_depth_np = pred_depth*255.0
-            # pred_depth_np = pred_depth_np.detach().cpu().numpy().astype(np.uint8)
-            # pred_depth_np = (cmap(pred_depth_np)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
-            # depth_HW_np = depth_HW*255.0
-            # depth_HW_np = depth_HW_np.detach().cpu().numpy().astype(np.uint8)
-            # depth_HW_np = (cmap(depth_HW_np)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
-            # cv2.namedWindow("Combined Image", cv2.WINDOW_NORMAL)
-            # combined = np.hstack((pred_depth_np,depth_HW_np))
-            # # 将拼接后的图像放大 2 倍
-            # display_img = cv2.resize(combined, (combined.shape[1] * 4, combined.shape[0] * 4))
-            # cv2.resizeWindow("Combined Image", combined.shape[1] * 4, combined.shape[0] * 4)
-            # cv2.imshow("Combined Image", display_img)
-            # cv2.imshow("Raw Image", image_BGR)
-            # key = cv2.waitKey(0)
-            # if key == 27:  
-            #     cv2.destroyAllWindows()
+def show_depth_map_from_dataloader(model_size="large"):
+    """从数据加载器中读取图片并显示深度图"""
+    try:
+        # 从数据加载器中获取第一张图片
+        for data in dataloader:
+            # 先检查数据格式
+            print(f"数据类型: {type(data)}")
+            if isinstance(data, (list, tuple)):
+                print(f"数据长度: {len(data)}")
+                for i, item in enumerate(data):
+                    print(f"项目 {i}: {type(item)}, 形状: {item.shape if hasattr(item, 'shape') else 'N/A'}")
+            
+            # 根据实际数据长度处理
+            if isinstance(data, (list, tuple)):
+                if len(data) >= 9:
+                    # 完整格式：9个元素
+                    image_RGB, image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ = data
+                elif len(data) >= 3:
+                    # 简化格式：至少3个元素
+                    image_RGB, image_B1HW, image_mask_B1HW = data[:3]
+                    gt_pose_B44 = gt_pose_inv_B44 = intrinsics_B33 = intrinsics_inv_B33 = None
+                elif len(data) >= 2:
+                    # 更简化格式：至少2个元素
+                    image_RGB, image_B1HW = data[:2]
+                    image_mask_B1HW = None
+                    gt_pose_B44 = gt_pose_inv_B44 = intrinsics_B33 = intrinsics_inv_B33 = None
+                else:
+                    # 单个元素
+                    image_RGB = data[0]
+                    image_B1HW = image_RGB
+                    image_mask_B1HW = None
+                    gt_pose_B44 = gt_pose_inv_B44 = intrinsics_B33 = intrinsics_inv_B33 = None
+            else:
+                # 直接是图像数据
+                image_RGB = data
+                image_B1HW = data
+                image_mask_B1HW = None
+                gt_pose_B44 = gt_pose_inv_B44 = intrinsics_B33 = intrinsics_inv_B33 = None
+            
+            # 调整所有图像数据的尺寸到14的倍数（如果存在）
+            image_RGB = resize_to_multiple_of_14(image_RGB)
+            image_B1HW = resize_to_multiple_of_14(image_B1HW)
+            if image_mask_B1HW is not None:
+                image_mask_B1HW = resize_to_multiple_of_14(image_mask_B1HW)
+            
+            # 只处理第一张图片
+            image = image_B1HW[0] if image_B1HW.dim() == 4 else image_B1HW
+            
+            # 处理图像并获取深度图
+            print(image_RGB.shape)
+            image_np, depth_map = process_image(image_RGB, model_size)
+            
+            # 显示结果
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+            
+            # 确保图像格式正确用于显示
+            if len(image_np.shape) == 4:  # 如果是4D (B, C, H, W)
+                image_display = image_np[0]  # 取第一个batch
+                image_display = np.transpose(image_display, (1, 2, 0))  # 转换为HWC格式
+            elif image_np.shape[0] == 3:  # 如果是CHW格式
+                image_display = np.transpose(image_np, (1, 2, 0))
+            else:
+                image_display = image_np
+            
+            # 确保值在0-1范围内
+            if image_display.max() > 1.0:
+                image_display = image_display / 255.0
+            
+            ax1.imshow(image_display)
+            ax1.set_title('原图 (从数据加载器读取)')
+            ax1.axis('off')
+            
+            ax2.imshow(depth_map)
+            ax2.set_title(f'深度图 ({model_size} 模型)')
+            ax2.axis('off')
+            
+            plt.tight_layout()
+            plt.show()
+            
+            # 只处理一次，然后退出循环
+            break
+        
+    except Exception as e:
+        print(f"处理图像时出错: {e}")
+        print(f"数据集长度: {len(dataset)}")
+        # 尝试直接访问数据集
+        try:
+            sample = dataset[0]
+            print(f"数据集样本类型: {type(sample)}")
+            if isinstance(sample, (list, tuple)):
+                print(f"样本长度: {len(sample)}")
+        except Exception as e2:
+            print(f"访问数据集样本时出错: {e2}")
+
+if __name__ == "__main__":
+    # 从数据加载器中读取图片并显示深度图
+    show_depth_map_from_dataloader(model_size="small")

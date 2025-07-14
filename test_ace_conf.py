@@ -5,23 +5,21 @@ import argparse
 import logging
 import math
 import time
-from distutils.util import strtobool
+from setuptools._distutils.util import strtobool
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from torch.amp import autocast
+from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
 import dsacstar
-from ace_network_depth import Regressor
+from ace_network_conf import Regressor
 from dataset import CamLocDataset
 
 import ace_vis_util as vutil
-from ace_util import get_pixel_grid, to_homogeneous
 from ace_visualizer import ACEVisualizer
-from superpoint import SuperPointFrontend
 
 _logger = logging.getLogger(__name__)
 
@@ -95,34 +93,24 @@ if __name__ == '__main__':
     parser.add_argument('--render_frame_skip', type=int, default=1,
                         help='skip every xth frame for long and dense query sequences')
     
-    parser.add_argument('--weights_path', type=str, default='superpoint_v1.pth',
-      help='Path to pretrained weights file (default: superpoint_v1.pth).')
-    
-    parser.add_argument('--nms_dist', type=int, default=1,
-      help='Non Maximum Suppression (NMS) distance (default: 4).')
-    
-    parser.add_argument('--conf_thresh', type=float, default=0.05,
-      help='Detector confidence threshold (default: 0.015).')
-    
-    parser.add_argument('--nn_thresh', type=float, default=0.7,
-      help='Descriptor matching threshold (default: 0.7).')
-    
     parser.add_argument('--out_path', type=str, default="img",
       help='存储误差大/小的图像序列的路径')
 
     opt = parser.parse_args()
 
     device = torch.device("cuda")
-    cuda = device==torch.device("cuda")
     num_workers = 6
 
     scene_path = Path(opt.scene)
-    network_path = Path(opt.network)
+    head_network_path = Path(opt.network)
     encoder_path = Path(opt.encoder_path)
     session = opt.session
-    filename = str(network_path).split('/')[-1]
-    # 再使用 split 方法将文件名按照点. 分割，并获取第一个元素
-    img_idx_path = str(filename).split('.')[0]
+    img_idx_path = opt.out_path
+
+    # 误差较大的点的文件名
+    big_error = []
+    # 误差小的点
+    little_error = []
 
     # Setup dataset.
     testset = CamLocDataset(
@@ -136,23 +124,20 @@ if __name__ == '__main__':
     testset_loader = DataLoader(testset, shuffle=False, num_workers=6)
 
     # Load network weights.
-    encoder_state_dict = torch.load(encoder_path, map_location="cpu")
+    encoder_state_dict = torch.load(encoder_path, map_location="cpu", weights_only=True)
     _logger.info(f"Loaded encoder from: {encoder_path}")
-    network_state_dict = torch.load(network_path, map_location="cpu")
-    _logger.info(f"Loaded head weights from: {network_path}")
+    head_state_dict = torch.load(head_network_path, map_location="cpu", weights_only=True)
+    _logger.info(f"Loaded head weights from: {head_network_path}")
 
     # Create regressor.
-    network = Regressor.create_from_split_state_dict(encoder_state_dict, network_state_dict)
-    # create superpointfronted
-    superpoint = SuperPointFrontend(network.superpoint,opt.weights_path,opt.nms_dist,opt.conf_thresh,opt.nn_thresh,cuda)
-    #superpoint.net = network.superpoint
+    network = Regressor.create_from_split_state_dict(encoder_state_dict, head_state_dict)
 
     # Setup for evaluation.
     network = network.to(device)
     network.eval()
 
     # Save the outputs in the same folder as the network being evaluated.
-    output_dir = network_path.parent
+    output_dir = head_network_path.parent
     scene_name = scene_path.name
     # This will contain aggregate scene stats (median translation/rotation errors, and avg processing time per frame).
     test_log_file = output_dir / f'test_{scene_name}_{opt.session}.txt'
@@ -179,11 +164,6 @@ if __name__ == '__main__':
     pct5 = 0
     pct2 = 0
     pct1 = 0
-
-    # 误差较大的点的文件名
-    big_error = []
-    # 误差小的点
-    little_error = []
 
     # Generate video of training process
     if opt.render_visualization:
@@ -216,7 +196,6 @@ if __name__ == '__main__':
         ace_visualizer = None
 
     # Testing loop.
-    pixel_grid_2HW = get_pixel_grid(network.OUTPUT_SUBSAMPLE)
     testing_start_time = time.time()
     with torch.no_grad():
         for image_RGB,image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
@@ -226,23 +205,20 @@ if __name__ == '__main__':
             image_B1HW = image_B1HW.to(device, non_blocking=True)
 
             # Predict scene coordinates.
-            with autocast('cuda', enabled=True):
-                #############################
-                # scene_coordinates_B3HW,scene_coordinates_BN3,patch_idx,fH,fW = network(image_B1HW,superpoint)
-                #############################
-                scene_coordinates_B3HW = network(image_B1HW)
+            with torch.amp.autocast('cuda', enabled=True):
+                scene_coordinates_B3HW ,log_variance_B1HW= network(image_B1HW)
 
             # We need them on the CPU to run RANSAC.
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
-            # scene_coordinates_BN3 = scene_coordinates_BN3.float().cpu()
+
+            # Calculate sampling weights from log variance
+            # weight = 1 / variance = 1 / exp(log_variance) = exp(-log_variance)
+            sampling_weights_B1HW = torch.exp(-log_variance_B1HW)
+            sampling_weights_B1HW = sampling_weights_B1HW.float().cpu()
 
             # Each frame is processed independently.
-            # 修改推理采样 ###################
-            # for frame_idx, (scene_coordinates_3HW,scene_coordinates_N3, gt_pose_44, intrinsics_33, frame_path) in enumerate(
-            #         zip(scene_coordinates_B3HW,scene_coordinates_BN3, gt_pose_B44, intrinsics_B33, filenames)):
-            ####################################
-            for frame_idx, (scene_coordinates_3HW, gt_pose_44, intrinsics_33, frame_path) in enumerate(
-                    zip(scene_coordinates_B3HW, gt_pose_B44, intrinsics_B33, filenames)):
+            for frame_idx, (scene_coordinates_3HW, sampling_weights_1HW, gt_pose_44, intrinsics_33, frame_path) in enumerate(
+                    zip(scene_coordinates_B3HW, sampling_weights_B1HW,gt_pose_B44, intrinsics_B33, filenames)):
 
                 # Extract focal length and principal point from the intrinsics matrix.
                 focal_length = intrinsics_33[0, 0].item()
@@ -257,17 +233,9 @@ if __name__ == '__main__':
                 # Allocate output variable.
                 out_pose = torch.zeros((4, 4))
 
-                ##########################################################
-                # pixel_positions_B2HW = pixel_grid_2HW[:, :fH, :fW].clone()  # It's 2xHxW (actual H and W) now.
-                # points_map_2d = pixel_positions_B2HW.permute(1, 2, 0).view(-1, 2)
-                # points_2d = points_map_2d[patch_idx.to('cpu')]
-                # inliers = torch.zeros(len(points_2d), dtype=torch.int)
-                ##########################################################
-                
-                # Compute the pose via RANSAC.   
-                print(scene_coordinates_3HW.shape)
-                inlier_count = dsacstar.forward_rgb(
-                    scene_coordinates_3HW.unsqueeze(0),  # 添加batch维度 [1, 3, 60, 80]
+                inlier_count = dsacstar.forward_rgb_weighted( # We will create this new function
+                    scene_coordinates_3HW.unsqueeze(0),
+                    sampling_weights_1HW.unsqueeze(0), # Pass the weights
                     out_pose,
                     opt.hypotheses,
                     opt.threshold,
@@ -347,6 +315,15 @@ if __name__ == '__main__':
     total_frames = len(rErrs)
     assert total_frames == len(testset)
 
+    # Compute median errors.
+    tErrs.sort()
+    rErrs.sort()
+    median_idx = total_frames // 2
+    median_rErr = rErrs[median_idx]
+    median_tErr = tErrs[median_idx]
+    ave_rErr = sum(rErrs)/len(rErrs)
+    ave_tErr = sum(tErrs)/len(tErrs)
+
     # 保存所需文件名列表
     big_path = f'{img_idx_path}_big_error.txt'
     little_path = f'{img_idx_path}_little_error.txt'
@@ -358,20 +335,10 @@ if __name__ == '__main__':
             file.write(line + "\n")
     print(f"列表已成功保存到文件：{big_path},{little_path}")  
 
-    # Compute median errors.
-    tErrs.sort()
-    rErrs.sort()
-    median_idx = total_frames // 2
-    median_rErr = rErrs[median_idx]
-    median_tErr = tErrs[median_idx]
-    ave_rErr = sum(rErrs)/len(rErrs)
-    ave_tErr = sum(tErrs)/len(tErrs)
-
     # Compute average time.
     avg_time = avg_batch_time / num_batches
 
     # Compute final metrics.
-    print(pct10_5)
     pct10_5 = pct10_5 / total_frames * 100
     pct5 = pct5 / total_frames * 100
     pct2 = pct2 / total_frames * 100
@@ -381,7 +348,6 @@ if __name__ == '__main__':
     _logger.info("Test complete.")
 
     _logger.info('Accuracy:')
-    _logger.info(f'\t{pct10_5_up}%')
     _logger.info(f'\t10cm/5deg: {pct10_5:.1f}%')
     _logger.info(f'\t5cm/5deg: {pct5:.1f}%')
     _logger.info(f'\t2cm/2deg: {pct2:.1f}%')
@@ -392,7 +358,7 @@ if __name__ == '__main__':
     _logger.info(f"Avg. processing time: {avg_time * 1000:4.1f}ms")
 
     # Write to the test log file as well.
-    test_log.write(f"{pct10_5} {pct5} {pct2} {pct1} {median_rErr} {ave_rErr}\n")
+    test_log.write(f"{median_rErr} {median_tErr} {avg_time}\n")
 
     test_log.close()
     pose_log.close()

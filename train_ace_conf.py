@@ -3,10 +3,10 @@
 
 import argparse
 import logging
-from distutils.util import strtobool
+from setuptools._distutils.util import strtobool
 from pathlib import Path
 
-from ace_trainer_depth import TrainerACE
+from ace_trainer_conf import TrainerACE
 
 
 def _strtobool(x):
@@ -27,14 +27,11 @@ if __name__ == '__main__':
 
     parser.add_argument('output_map_file', type=Path,
                         help='target file for the trained network')
-    
-    parser.add_argument('output_map_depth', type=Path,
-                        help='target file for the trained network')
 
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
                         help='file containing pre-trained encoder weights')
 
-    parser.add_argument('--num_head_blocks', type=int, default=4,
+    parser.add_argument('--num_head_blocks', type=int, default=1,
                         help='depth of the regression head, defines the map size')
 
     parser.add_argument('--learning_rate_min', type=float, default=0.0005,
@@ -126,40 +123,6 @@ if __name__ == '__main__':
 
     parser.add_argument('--render_camera_z_offset', type=int, default=4,
                         help='zoom out of the scene by moving render camera backwards, in meters')
-    
-    # Params for the superpoint. 
-    parser.add_argument('--weights_path', type=str, default='superpoint_v1.pth',
-      help='Path to pretrained weights file (default: superpoint_v1.pth).')
-    
-    parser.add_argument('--nms_dist', type=int, default=4,
-      help='Non Maximum Suppression (NMS) distance (default: 4).')
-    
-    parser.add_argument('--conf_thresh', type=float, default=0.02,
-      help='Detector confidence threshold (default: 0.015).')
-    
-    parser.add_argument('--nn_thresh', type=float, default=0.7,
-      help='Descriptor matching threshold (default: 0.7).')
-    
-    # Params for the depth anything. 
-    parser.add_argument('--depth_encoder', type=str, default='vits', choices=['vits', 'vitb', 'vitl', 'vitg'])
-
-    parser.add_argument('--depth_epochs', type=int, default=200,
-                        help='number of runs through the training buffer')
-    
-    parser.add_argument('--depth_batch_size', type=int, default=1,
-                        help='number of patches for each parameter update (has to be a multiple of 512)')
-    
-    parser.add_argument('--depth_iterations', type=int, default=1000,
-                        help='number of runs through the training buffer')
-    
-    parser.add_argument('--input_size', type=int, default=518)
-
-    parser.add_argument('--RelativeDepthLoss_weight', type=float, default=1,
-                        help='计算深度损失时相对深度损失权重')
-
-    parser.add_argument('--DepthLoss_weight', type=float, default=0.2,
-                        help='回归时所用损失中深度损失的权重')
-
 
     options = parser.parse_args()
 

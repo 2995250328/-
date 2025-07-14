@@ -166,7 +166,9 @@ class CamLocDataset(Dataset):
                 # transforms.Resize(int(self.image_height * scale_factor)),
                 # transforms.ColorJitter(brightness=self.aug_black_white, contrast=self.aug_black_white,saturation=0.4, hue=0.1),
                 # saturation=self.aug_color, hue=self.aug_color),  # Disable colour augmentation.
-                transforms.ToTensor()
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                      std=[0.229, 0.224, 0.225])
             ])
         else:
             self.image_transform = transforms.Compose([
@@ -184,7 +186,9 @@ class CamLocDataset(Dataset):
                 # transforms.Resize(int(self.image_height * scale_factor)),
                 # transforms.ColorJitter(brightness=self.aug_black_white, contrast=self.aug_black_white,saturation=0.4, hue=0.1),
                 # saturation=self.aug_color, hue=self.aug_color),  # Disable colour augmentation.
-                transforms.ToTensor()
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                      std=[0.229, 0.224, 0.225])
                 # transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
             ])
 

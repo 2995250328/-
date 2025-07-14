@@ -29,6 +29,46 @@ from ace_visualizer import ACEVisualizer
 
 _logger = logging.getLogger(__name__)
 
+def resize_to_multiple_of_14(tensor):
+    """调整tensor尺寸到14的倍数"""
+    if tensor.dim() == 4:  # (B, C, H, W)
+        _, _, h, w = tensor.shape
+    elif tensor.dim() == 3:  # (C, H, W)
+        _, h, w = tensor.shape
+    else:
+        return tensor
+    
+    new_h = ((h + 13) // 14) * 14  # 向上取整到最近的14的倍数
+    new_w = ((w + 13) // 14) * 14  # 向上取整到最近的14的倍数
+    
+    if new_h != h or new_w != w:
+        # 确保输入是4D tensor (N, C, H, W)
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)  # 添加batch维度
+        
+        # 根据数据类型选择插值模式
+        if tensor.dtype == torch.bool:
+            # 布尔类型使用nearest插值
+            tensor = torch.nn.functional.interpolate(
+                tensor.float(),  # 转换为float进行插值
+                size=(new_h, new_w), 
+                mode='nearest'
+            ).bool()  # 转换回bool
+        else:
+            # 其他类型使用bilinear插值
+            tensor = torch.nn.functional.interpolate(
+                tensor, 
+                size=(new_h, new_w), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # 如果原来是3D，去掉batch维度
+        if tensor.shape[0] == 1 and tensor.dim() == 3:
+            tensor = tensor.squeeze(0)
+    
+    return tensor
+
 def find_neighbors_with_confidence(coords, H, W, patch_size, include_diagonal=8):
     """
     Find neighbors for a 3D coordinate tensor with confidence values, filter duplicates
@@ -288,6 +328,7 @@ class TrainerACE:
             # Train the regression head.
             for self.epoch in range(self.options.epochs):
                 epoch_start_time = time.time()
+                # self.depth_run_epoch()
                 self.run_epoch()
                 training_time += time.time() - epoch_start_time
         
@@ -827,12 +868,12 @@ class TrainerACE:
         loss = loss_valid + loss_invalid
         loss /= batch_size      
         # 可调节深度损失进入时间
-        if self.iteration>0.25*self.iterations:
+        if self.iteration>0.20*self.iterations:
             loss_depth = self.depth_run_epoch(training_dataloader)
             loss = loss + (self.iteration/(self.iterations*(1/self.options.DepthLoss_weight)))*loss_depth
 
         # We need to check if the step actually happened, since the scaler might skip optimisation steps.
-        old_optimizer_step = self.optimizer._step_count
+        old_optimizer_step = self.optimizer.state.get('step', 0)
 
         # Optimization steps.
         self.optimizer.zero_grad(set_to_none=True)
@@ -855,7 +896,7 @@ class TrainerACE:
                 self.ace_visualizer.render_mapping_frame(vis_scene_coords, vis_errors)
 
         # Only step if the optimizer stepped and if we're not over-stepping the total_steps supported by the scheduler.
-        if old_optimizer_step < self.optimizer._step_count < self.scheduler.total_steps:
+        if old_optimizer_step < self.optimizer.state.get('step', 0) < self.scheduler.total_steps:
             self.scheduler.step()
 
     def RGBD_run_epoch(self,training_dataloader):
@@ -893,13 +934,48 @@ class TrainerACE:
        
         # for image_RGB,image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
         batch_data = next(iter(training_dataloader))
+        scale = random.choices([1,2,4], weights=[1, 0, 0], k=1)[0]     
+        def random_crop_tensor(tensor, scale, crop_uv=None):
+            """
+            对输入 tensor 做在相同相对位置的随机裁剪。
+            
+            参数:
+            tensor: torch.Tensor, shape (C, H, W)
+            scale: int, 1/2/4
+            crop_uv: tuple (u, v) 可选，用于指定相对左上角位置。
+                    u,v ∈ [0,1]。若为 None 则自动生成。
+            返回:
+            裁剪后的 tensor， 以及 (u,v)
+            """
+            B, C, H, W = tensor.shape
+            
+            if scale == 1:
+                return tensor, (None, None)  # 不裁剪
+            
+            crop_h = H // scale
+            crop_w = W // scale
+            
+            if crop_uv is None:
+                u = random.uniform(0, 1)
+                v = random.uniform(0, 1)
+            else:
+                u, v = crop_uv
+            
+            # 转换为像素坐标，保证不会越界
+            top = int(u * (H - crop_h))
+            left = int(v * (W - crop_w))
+            
+            return tensor[:,:, top:top+crop_h, left:left+crop_w],(u,v)
+        
         image_RGB, image_B1HW, image_mask_B1HW, gt_pose_B44,gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ = batch_data
         image_B1HW = image_B1HW.to(self.device, non_blocking=True)
         gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
         intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
         intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
-        image_RGB = image_RGB.permute(0, 2, 3, 1).squeeze(0).numpy().astype(np.uint8)  # 调整维度顺序为 HWC
-        image_BGR = cv2.cvtColor(image_RGB, cv2.COLOR_RGB2BGR)  # RGB→BGR转换
+
+        image_RGB,uv  = random_crop_tensor(image_RGB,scale)
+        image_RGB_np = image_RGB.permute(0, 2, 3, 1).squeeze(0).numpy().astype(np.uint8)  # 调整维度顺序为 HWC
+        image_BGR = cv2.cvtColor(image_RGB_np, cv2.COLOR_RGB2BGR)  # RGB→BGR转换
         with autocast(enabled=self.options.use_half):
             with torch.no_grad():
                 features_BCHW = self.regressor.get_features(image_B1HW)
@@ -907,22 +983,23 @@ class TrainerACE:
         B, C, H, W = features_BCHW.shape
         with torch.no_grad():
             depth_HW = self.depth_anything.infer_image(image_BGR,self.options.input_size)
-        # 归一化深度图
-        depth_HW = (depth_HW - depth_HW.min()) / (depth_HW.max() - depth_HW.min())
-        depth_HW = torch.from_numpy(depth_HW).to(self.device,dtype=pred_scene_coords_b3HW.dtype).unsqueeze(0).unsqueeze(0)
-        depth_HW = F.avg_pool2d(depth_HW,kernel_size=8, stride=8).squeeze(0).squeeze(0)      
+        # 归一化深度图     
+        # depth_HW = (depth_HW - depth_HW.min()) / (depth_HW.max() - depth_HW.min())
+        # depth_HW = torch.from_numpy(depth_HW).to(self.device,dtype=pred_scene_coords_b3HW.dtype) 
+        depth_HW = torch.from_numpy(depth_HW).to(self.device,dtype=pred_scene_coords_b3HW.dtype)
+        depth_HW = (depth_HW - torch.median(depth_HW)) / (torch.mean(torch.abs(depth_HW - torch.median(depth_HW)))+1e-5)   
 
         # Back to the original shape. Convert to float32 as well.
-        pred_scene_coords_N31 = pred_scene_coords_b3HW[:,:,:depth_HW.shape[0],:depth_HW.shape[1]].permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        pred_scene_coords_N31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
 
         # Make 3D points homogeneous so that we can easily matrix-multiply them.
         pred_scene_coords_N41 = to_homogeneous(pred_scene_coords_N31)
 
         gt_pose_inv = gt_pose_inv_B44[:, :3]
-        gt_inv_poses_b34 = gt_pose_inv.unsqueeze(1).expand(B, depth_HW.shape[0] * depth_HW.shape[1], 3, 4).reshape(-1, 3, 4)
+        gt_inv_poses_b34 = gt_pose_inv.unsqueeze(1).expand(B, H*W, 3, 4).reshape(-1, 3, 4)
         # Scene coordinates to camera coordinates.
         pred_cam_coords_N31 = torch.bmm(gt_inv_poses_b34, pred_scene_coords_N41)            
-        pred_cam_coords_b3HW = pred_cam_coords_N31.squeeze(-1).unflatten(0,(B,depth_HW.shape[0],depth_HW.shape[1])).permute(0, 3, 1, 2)
+        pred_cam_coords_b3HW = pred_cam_coords_N31.squeeze(-1).unflatten(0,(B,H,W)).permute(0, 3, 1, 2)
 
         # Project scene coordinates.
         intrinsics_B33 = intrinsics_B33.repeat(pred_cam_coords_N31.shape[0],1,1)
@@ -938,9 +1015,9 @@ class TrainerACE:
 
         # Measure reprojection error.
         # Create a tensor with the pixel coordinates of every feature vector.
-        pixel_positions_B2HW = self.pixel_grid_2HW[:, :depth_HW.shape[0],:depth_HW.shape[1]].clone()  # It's 2xHxW (actual H and W) now.
+        pixel_positions_B2HW = self.pixel_grid_2HW[:, :H,:W].clone()  # It's 2xHxW (actual H and W) now.
         pixel_positions_B2HW = pixel_positions_B2HW[None]  # 1x2xHxW
-        pixel_positions_B2HW = pixel_positions_B2HW.expand(B, 2, depth_HW.shape[0], depth_HW.shape[1])  # Bx2xHxW
+        pixel_positions_B2HW = pixel_positions_B2HW.expand(B, 2, H, W)  # Bx2xHxW
         def normalize_shape(tensor_in):
                 """Bring tensor from shape BxCxHxW to NxC"""
                 return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
@@ -948,7 +1025,7 @@ class TrainerACE:
         target_px_b2 = normalize_shape(pixel_positions_B2HW)
         reprojection_error_b2 = pred_px_b21.squeeze(2) - target_px_b2
         reprojection_error_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
-        reprojection_error_B1HW = reprojection_error_b1.unflatten(0,(B,depth_HW.shape[0],depth_HW.shape[1])).permute(0, 3, 1, 2)
+        reprojection_error_B1HW = reprojection_error_b1.unflatten(0,(B,H,W)).permute(0, 3, 1, 2)
 
         # Predicted coordinates behind or close to camera plane.
         invalid_min_depth_b1 = pred_cam_coords_b3HW[:, 2] < self.options.depth_min
@@ -960,10 +1037,20 @@ class TrainerACE:
         # Invalid mask is the union of all these. Valid mask is the opposite.
         invalid_mask_B1HW = (invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1)
         valid_mask_B1HW = ~invalid_mask_B1HW
-        valid_mask_HW = valid_mask_B1HW.squeeze(0).squeeze(0)
+        valid_mask_B1HW,_ = random_crop_tensor(valid_mask_B1HW,scale,uv)
+        valid_mask_HW = valid_mask_B1HW.squeeze(0).squeeze(0)  
 
+        norm_flag = random.choices([0,1],weights=[1,0.],k=1)[0]
         pred_depth = pred_cam_coords_b3HW[:,2,:,:].squeeze(0)
-        pred_depth = 1-(pred_depth-torch.min(pred_depth)) / (torch.max(pred_depth)-torch.min(pred_depth)+1e-5)
+        if norm_flag == 0:# 全局归一化          
+            pred_depth = 1-(pred_depth-torch.median(pred_depth)) / (torch.mean(pred_depth - torch.median(pred_depth))+1e-5)
+            pred_depth,_ = random_crop_tensor(pred_depth.unsqueeze(0).unsqueeze(1),scale,uv)            
+        else:# 局部归一化
+            pred_depth,_ = random_crop_tensor(pred_depth.unsqueeze(0).unsqueeze(1),scale,uv)
+            pred_depth = 1-(pred_depth-torch.median(pred_depth)) / (torch.mean(pred_depth - torch.median(pred_depth))+1e-5)
+        pred_depth = pred_depth.squeeze(0).squeeze(0)
+        depth_HW = F.interpolate(depth_HW.unsqueeze(0).unsqueeze(0), size=(pred_depth.shape[0], pred_depth.shape[1]), mode='bilinear', align_corners=True) 
+        depth_HW = depth_HW.squeeze(0).squeeze(0)
         # 尺度对齐
         # s = torch.median(depth_HW) / torch.median(pred_depth)
         # pred_depth = pred_depth*s
@@ -985,8 +1072,9 @@ class TrainerACE:
         # key = cv2.waitKey(0)
         # if key == 27:  
         #     cv2.destroyAllWindows()
-
-        loss = self.depth_loss(pred_depth,depth_HW,valid_mask_HW)
+        image = F.interpolate(image_RGB, size=(pred_depth.shape[0], pred_depth.shape[1]), mode='bilinear', align_corners=True) 
+        loss = self.depth_loss(pred_depth,depth_HW,valid_mask_HW, image)
+        print(image.shape)
         if math.isnan(loss):
             print('pred_depth')
             print(pred_depth)
